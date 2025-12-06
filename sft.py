@@ -8,7 +8,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments,
 # CONFIG
 # =============================================================================
 MODEL_NAME = "canopylabs/orpheus-3b-0.1-ft"
-DATASET_NAME = "mrfakename/emoact_prompts_with_language"
+DATASET_NAME = "mrfakename/voice-acting"
 DEVICE = "cuda"
 SAMPLE_RATE = 24000
 MAX_SEQ_LENGTH = 4096
