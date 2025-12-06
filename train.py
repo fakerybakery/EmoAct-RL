@@ -1,11 +1,9 @@
-import os
 import re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchaudio
 import torchaudio.transforms as T
-from datasets import Audio, load_dataset
+from datasets import load_dataset
 from snac import SNAC
 from transformers import (
     AutoModelForCausalLM,
@@ -127,27 +125,8 @@ audiobox_predictor = initialize_predictor()
 RESAMPLER_24_TO_16 = T.Resample(orig_freq=24000, new_freq=16000).to(DEVICE)
 
 # =============================================================================
-# AUDIO TOKENIZATION
+# AUDIO DECODING (for reward computation)
 # =============================================================================
-def tokenize_audio(waveform):
-    waveform = torch.from_numpy(waveform).unsqueeze(0).to(dtype=torch.float32)
-    waveform = waveform.unsqueeze(0).to(DEVICE)
-    
-    with torch.inference_mode():
-        codes = snac_model.encode(waveform)
-    
-    all_codes = []
-    for i in range(codes[0].shape[1]):
-        all_codes.append(codes[0][0][i].item() + 128266)
-        all_codes.append(codes[1][0][2 * i].item() + 128266 + 4096)
-        all_codes.append(codes[2][0][4 * i].item() + 128266 + (2 * 4096))
-        all_codes.append(codes[2][0][(4 * i) + 1].item() + 128266 + (3 * 4096))
-        all_codes.append(codes[1][0][(2 * i) + 1].item() + 128266 + (4 * 4096))
-        all_codes.append(codes[2][0][(4 * i) + 2].item() + 128266 + (5 * 4096))
-        all_codes.append(codes[2][0][(4 * i) + 3].item() + 128266 + (6 * 4096))
-    
-    return all_codes
-
 def prepare_snac_codes(token_ids, device="cuda"):
     if isinstance(token_ids, torch.Tensor):
         token_ids = token_ids.tolist()
@@ -209,59 +188,11 @@ def decode_tokens_to_audio(token_ids, chunk_size=700):
 # =============================================================================
 print("Loading dataset...")
 dataset = load_dataset(DATASET_NAME, split="train")
-dataset = dataset.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
 
-def remove_duplicate_frames(example):
-    audio_array = example["audio"]["array"]
-    codes = tokenize_audio(audio_array)
-    
-    if len(codes) % 7 != 0:
-        example["codes_list"] = codes
-        return example
-    
-    result = codes[:7]
-    for i in range(7, len(codes), 7):
-        if codes[i] != result[-7]:
-            result.extend(codes[i:i + 7])
-    
-    example["codes_list"] = result
-    return example
-
-def create_input_ids(example):
-    # Format: <human> voice: <caption>caption</caption> text </human> <ai> <speech>codes</speech> </ai>
-    text_ids = tokenizer.encode(example["text"], add_special_tokens=True)
-    text_ids.append(END_OF_TEXT)
-    
-    caption_ids = tokenizer.encode(example["caption"], add_special_tokens=False)
-    voice_ids = tokenizer.encode(f"{example['voice']}: ", add_special_tokens=False)
-    
-    input_ids = (
-        [START_OF_HUMAN]
-        + voice_ids
-        + [START_OF_CAPTION]
-        + caption_ids
-        + [END_OF_CAPTION]
-        + text_ids
-        + [END_OF_HUMAN]
-        + [START_OF_AI]
-        + [START_OF_SPEECH]
-        + example["codes_list"]
-        + [END_OF_SPEECH]
-        + [END_OF_AI]
-    )
-    
-    example["labels"] = input_ids
-    return example
-
-print("Processing dataset...")
-dataset = dataset.map(remove_duplicate_frames)
-dataset = dataset.map(create_input_ids, remove_columns=["codes_list"])
-
-# Create prompt format
+# Create prompt format (no audio needed - model generates it, rewards score it)
 dataset = dataset.map(
     lambda x: {
         "prompt": [{"role": "user", "content": f"{x['voice']}: <start_of_caption>{x['caption']}<end_of_caption>{x['text']}"}],
-        "answer": "".join(tokenizer.batch_decode(x["labels"][x["labels"].index(END_OF_TEXT):])),
     }
 )
 
