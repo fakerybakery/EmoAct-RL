@@ -259,7 +259,7 @@ def wer_reward(prompts, completions, **kwargs):
             
             # ASR
             audio_np = audio.squeeze().cpu().numpy()
-            result = asr_pipe(audio_np)
+            result = asr_pipe(audio_np, return_timestamps=True)
             transcribed = result["text"]
             
             # WER -> accuracy
@@ -346,8 +346,10 @@ def audiobox_reward(prompts, completions, **kwargs):
 # =============================================================================
 # TRAINING CONFIG
 # =============================================================================
+from trl import GRPOConfig
+
 training_args = GRPOConfig(
-    # ---- training hyperparams ----
+    # ---- core training hyperparams ----
     learning_rate=1e-5,
     weight_decay=0.01,
     warmup_ratio=0.1,
@@ -362,25 +364,24 @@ training_args = GRPOConfig(
     output_dir="outputs",
     bf16=True,
 
-    # ---- GRPO generation settings ----
+    # ---- GRPO / generation settings ----
     num_generations=4,
     max_prompt_length=2048,
     max_completion_length=2048,
+
     temperature=0.8,
     top_p=0.95,
-    top_k=None,      # None = no top-k, equivalent to your previous -1
+    top_k=None,   # None ~ no top-k
     min_p=0.1,
 
-    # extra SamplingParams args go here when using vLLM
+    # passed through to model.generate
     generation_kwargs={
         "stop": [tokenizer.eos_token],
-        "include_stop_str_in_output": True,
+        "pad_token_id": tokenizer.eos_token_id,
     },
 
-    # ---- turn on vLLM in "colocate" mode ----
-    use_vllm=True,
-    vllm_mode="colocate",          # avoids needing an external vLLM server
-    # vllm_gpu_memory_utilization=0.3,  # optional; 0.3 is the default in main
+    # IMPORTANT: let GRPO use standard HF generation, not vLLM
+    use_vllm=False,   # or just omit; default is False in recent TRL
 )
 
 
