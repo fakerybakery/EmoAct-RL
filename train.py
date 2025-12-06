@@ -126,29 +126,77 @@ RESAMPLER_24_TO_16 = T.Resample(orig_freq=24000, new_freq=16000).to(DEVICE)
 # =============================================================================
 # AUDIO DECODING (for reward computation)
 # =============================================================================
+# SNAC codebook size per quantizer
+SNAC_VOCAB_SIZE = 4096
+
+# Audio token range in Orpheus tokenizer
+AUDIO_TOKEN_START = 128266
+AUDIO_TOKEN_END = AUDIO_TOKEN_START + (7 * SNAC_VOCAB_SIZE)  # 128266 + 28672
+
+def is_valid_audio_token(token_id):
+    """Check if a token ID is a valid SNAC audio token."""
+    return AUDIO_TOKEN_START <= token_id < AUDIO_TOKEN_END
+
+def count_invalid_tokens(token_ids):
+    """Count how many tokens are outside the valid SNAC audio range."""
+    return sum(1 for t in token_ids if not is_valid_audio_token(t))
+
+def filter_valid_audio_tokens(token_ids):
+    """Filter to only valid SNAC audio tokens and ensure length is multiple of 7."""
+    valid = [t for t in token_ids if is_valid_audio_token(t)]
+    # Trim to multiple of 7
+    valid = valid[:(len(valid) // 7) * 7]
+    return valid
+
 def prepare_snac_codes(token_ids, device="cuda"):
     if isinstance(token_ids, torch.Tensor):
         token_ids = token_ids.tolist()
+    
+    # Filter to only valid audio tokens
+    token_ids = filter_valid_audio_tokens(token_ids)
     
     if len(token_ids) < 7:
         empty = torch.tensor([], dtype=torch.long, device=device).unsqueeze(0)
         return [empty.clone(), empty.clone(), empty.clone()]
     
-    new_length = (len(token_ids) // 7) * 7
-    trimmed = token_ids[:new_length]
-    processed = [t - 128266 for t in trimmed]
-    
     layer_1, layer_2, layer_3 = [], [], []
     
-    for i in range(len(processed) // 7):
+    for i in range(len(token_ids) // 7):
         base = 7 * i
-        layer_1.append(processed[base])
-        layer_2.append(processed[base + 1] - 4096)
-        layer_3.append(processed[base + 2] - 2 * 4096)
-        layer_3.append(processed[base + 3] - 3 * 4096)
-        layer_2.append(processed[base + 4] - 4 * 4096)
-        layer_3.append(processed[base + 5] - 5 * 4096)
-        layer_3.append(processed[base + 6] - 6 * 4096)
+        
+        # Decode each position with its offset
+        # Position 0: layer 1, offset 0
+        l1_val = token_ids[base] - AUDIO_TOKEN_START
+        # Position 1: layer 2, offset 4096
+        l2_val_a = token_ids[base + 1] - AUDIO_TOKEN_START - SNAC_VOCAB_SIZE
+        # Position 2: layer 3, offset 8192
+        l3_val_a = token_ids[base + 2] - AUDIO_TOKEN_START - (2 * SNAC_VOCAB_SIZE)
+        # Position 3: layer 3, offset 12288
+        l3_val_b = token_ids[base + 3] - AUDIO_TOKEN_START - (3 * SNAC_VOCAB_SIZE)
+        # Position 4: layer 2, offset 16384
+        l2_val_b = token_ids[base + 4] - AUDIO_TOKEN_START - (4 * SNAC_VOCAB_SIZE)
+        # Position 5: layer 3, offset 20480
+        l3_val_c = token_ids[base + 5] - AUDIO_TOKEN_START - (5 * SNAC_VOCAB_SIZE)
+        # Position 6: layer 3, offset 24576
+        l3_val_d = token_ids[base + 6] - AUDIO_TOKEN_START - (6 * SNAC_VOCAB_SIZE)
+        
+        # Validate all values are in valid range [0, 4096)
+        all_vals = [l1_val, l2_val_a, l2_val_b, l3_val_a, l3_val_b, l3_val_c, l3_val_d]
+        if not all(0 <= v < SNAC_VOCAB_SIZE for v in all_vals):
+            # Skip this frame if any value is invalid
+            continue
+        
+        layer_1.append(l1_val)
+        layer_2.append(l2_val_a)
+        layer_2.append(l2_val_b)
+        layer_3.append(l3_val_a)
+        layer_3.append(l3_val_b)
+        layer_3.append(l3_val_c)
+        layer_3.append(l3_val_d)
+    
+    if not layer_1:
+        empty = torch.tensor([], dtype=torch.long, device=device).unsqueeze(0)
+        return [empty.clone(), empty.clone(), empty.clone()]
     
     return [
         torch.tensor(layer_1, dtype=torch.long, device=device).unsqueeze(0),
@@ -163,6 +211,12 @@ def decode_tokens_to_audio(token_ids, chunk_size=700):
     if not token_ids:
         return None
     
+    # Pre-filter all tokens
+    token_ids = filter_valid_audio_tokens(token_ids)
+    
+    if len(token_ids) < 7:
+        return None
+    
     segments = []
     for i in range(0, len(token_ids), chunk_size):
         chunk = token_ids[i:i + chunk_size]
@@ -171,11 +225,15 @@ def decode_tokens_to_audio(token_ids, chunk_size=700):
         if codes[0].numel() == 0:
             continue
         
-        with torch.no_grad():
-            audio = snac_model.decode(codes)
-            if audio.ndim == 2:
-                audio = audio.unsqueeze(1)
-            segments.append(audio.cpu())
+        try:
+            with torch.no_grad():
+                audio = snac_model.decode(codes)
+                if audio.ndim == 2:
+                    audio = audio.unsqueeze(1)
+                segments.append(audio.cpu())
+        except Exception as e:
+            print(f"SNAC decode error: {e}")
+            continue
     
     if not segments:
         return None
@@ -225,6 +283,9 @@ def get_clap_audio_embedding(waveform_16k):
         emb = clap_audio_model(inputs.input_features.to(DEVICE))
     return emb
 
+# Penalty per invalid token
+INVALID_TOKEN_PENALTY = 0.1
+
 def wer_reward(prompts, completions, **kwargs):
     GLOBAL_AUDIO.clear()
     
@@ -244,14 +305,18 @@ def wer_reward(prompts, completions, **kwargs):
         codes = tokenizer.encode("".join(tokens).replace("<custom_token_4><custom_token_5><custom_token_1>", "").replace("<custom_token_2><custom_token_6><custom_token_3>", ""))[1:]
         
         if not codes:
-            scores.append(-1.0)
+            scores.append(-5.0)  # Big penalty for no codes at all
             GLOBAL_AUDIO.append(None)
             continue
+        
+        # Count invalid tokens and apply penalty
+        num_invalid = count_invalid_tokens(codes)
+        invalid_penalty = num_invalid * INVALID_TOKEN_PENALTY
         
         try:
             audio = decode_tokens_to_audio(codes)
             if audio is None:
-                scores.append(-1.0)
+                scores.append(-5.0 - invalid_penalty)  # Big penalty + invalid token penalty
                 GLOBAL_AUDIO.append(None)
                 continue
             
@@ -262,14 +327,15 @@ def wer_reward(prompts, completions, **kwargs):
             result = asr_pipe(audio_np, return_timestamps=True)
             transcribed = result["text"]
             
-            # WER -> accuracy
+            # WER -> accuracy, minus penalty for invalid tokens
             wer_score = compute_wer(expected_text.lower(), transcribed.lower())
             accuracy = max(0, 1 - wer_score)
-            scores.append(accuracy)
+            final_score = accuracy - invalid_penalty
+            scores.append(final_score)
             
         except Exception as e:
             print(f"WER error: {e}")
-            scores.append(-1.0)
+            scores.append(-5.0 - invalid_penalty)
             GLOBAL_AUDIO.append(None)
     
     return scores
