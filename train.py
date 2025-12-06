@@ -16,7 +16,6 @@ from transformers import (
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 from trl import GRPOConfig, GRPOTrainer
-from vllm import SamplingParams
 from jiwer import wer as compute_wer
 from audiobox_aesthetics.infer import initialize_predictor
 
@@ -347,18 +346,8 @@ def audiobox_reward(prompts, completions, **kwargs):
 # =============================================================================
 # TRAINING CONFIG
 # =============================================================================
-vllm_sampling_params = SamplingParams(
-    min_p=0.1,
-    top_p=0.95,
-    top_k=-1,
-    seed=42,
-    stop=[tokenizer.eos_token],
-    include_stop_str_in_output=True,
-)
-
 training_args = GRPOConfig(
-    vllm_sampling_params=vllm_sampling_params,
-    temperature=0.8,
+    # ---- training hyperparams ----
     learning_rate=1e-5,
     weight_decay=0.01,
     warmup_ratio=0.1,
@@ -367,15 +356,33 @@ training_args = GRPOConfig(
     logging_steps=1,
     per_device_train_batch_size=1,
     gradient_accumulation_steps=4,
-    num_generations=4,
-    max_prompt_length=2048,
-    max_completion_length=2048,
     num_train_epochs=1,
     save_steps=100,
     report_to="wandb",
     output_dir="outputs",
     bf16=True,
+
+    # ---- GRPO generation settings ----
+    num_generations=4,
+    max_prompt_length=2048,
+    max_completion_length=2048,
+    temperature=0.8,
+    top_p=0.95,
+    top_k=None,      # None = no top-k, equivalent to your previous -1
+    min_p=0.1,
+
+    # extra SamplingParams args go here when using vLLM
+    generation_kwargs={
+        "stop": [tokenizer.eos_token],
+        "include_stop_str_in_output": True,
+    },
+
+    # ---- turn on vLLM in "colocate" mode ----
+    use_vllm=True,
+    vllm_mode="colocate",          # avoids needing an external vLLM server
+    # vllm_gpu_memory_utilization=0.3,  # optional; 0.3 is the default in main
 )
+
 
 # =============================================================================
 # TRAINER
