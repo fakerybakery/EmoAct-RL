@@ -251,27 +251,34 @@ print("Loading voice prompts dataset...")
 voice_prompts_ds = load_dataset("mrfakename/voice_design", split="train")
 voice_prompts_ds = voice_prompts_ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
 
-# Pre-encode all voice prompts
-print("Pre-encoding voice prompts...")
-VOICE_PROMPT_TOKENS = []
+# Pre-encode all voice prompts with batched GPU processing
+print("Pre-encoding voice prompts (batched)...")
 
-for i, example in enumerate(voice_prompts_ds):
-    try:
-        audio_data = example.get("audio")
-        if audio_data and "array" in audio_data:
-            ref_tokens = encode_audio_to_tokens(audio_data["array"], audio_data["sampling_rate"])
-            # Limit reference audio length (max ~5 seconds)
-            max_ref_tokens = 609
-            if len(ref_tokens) > max_ref_tokens:
-                ref_tokens = ref_tokens[:max_ref_tokens]
-            if ref_tokens:
-                VOICE_PROMPT_TOKENS.append(ref_tokens)
-    except Exception as e:
-        print(f"Error encoding voice prompt {i}: {e}")
-    
-    if (i + 1) % 100 == 0:
-        print(f"Encoded {i + 1}/{len(voice_prompts_ds)} voice prompts")
+def encode_voice_prompts_batched(examples):
+    results = []
+    for audio_data in examples["audio"]:
+        try:
+            if audio_data and "array" in audio_data:
+                ref_tokens = encode_audio_to_tokens(audio_data["array"], audio_data["sampling_rate"])
+                max_ref_tokens = 609
+                if len(ref_tokens) > max_ref_tokens:
+                    ref_tokens = ref_tokens[:max_ref_tokens]
+                results.append(ref_tokens)
+            else:
+                results.append(None)
+        except Exception as e:
+            results.append(None)
+    return {"ref_tokens": results}
 
+voice_prompts_ds = voice_prompts_ds.map(
+    encode_voice_prompts_batched,
+    batched=True,
+    batch_size=32,
+    desc="Encoding voice prompts",
+)
+voice_prompts_ds = voice_prompts_ds.filter(lambda x: x["ref_tokens"] is not None)
+
+VOICE_PROMPT_TOKENS = voice_prompts_ds["ref_tokens"]
 print(f"Total voice prompts available: {len(VOICE_PROMPT_TOKENS)}")
 
 def process_example(example, idx):
