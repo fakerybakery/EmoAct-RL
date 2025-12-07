@@ -22,7 +22,7 @@ from audiobox_aesthetics.infer import initialize_predictor
 # =============================================================================
 # CONFIG
 # =============================================================================
-MODEL_NAME = "canopylabs/orpheus-3b-0.1-ft"
+MODEL_NAME = "ChristophSchuhmann/checkpoint-6260"
 DATASET_NAME = "mrfakename/emoact_prompts_with_language"
 DEVICE = "cuda"
 MAX_SEQ_LENGTH = 4096
@@ -241,27 +241,46 @@ def decode_tokens_to_audio(token_ids, chunk_size=700):
 # =============================================================================
 # DATASET PREPARATION
 # =============================================================================
-print("Loading dataset...")
-dataset = load_dataset(DATASET_NAME, split="train")
-dataset = dataset.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
+import random
 
-def process_example(example):
-    """
-    Create prompt with voice cloning format:
-    <human> Reference audio: <speech>ref_tokens</speech> Text: {caption} {text} <eot> </human> <ai> <speech>
-    """
+print("Loading datasets...")
+dataset = load_dataset(DATASET_NAME, split="train")
+
+# Load voice prompts dataset for random voice cloning references
+print("Loading voice prompts dataset...")
+voice_prompts_ds = load_dataset("mrfakename/voice_design", split="train")
+voice_prompts_ds = voice_prompts_ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
+
+# Pre-encode all voice prompts
+print("Pre-encoding voice prompts...")
+VOICE_PROMPT_TOKENS = []
+
+for i, example in enumerate(voice_prompts_ds):
     try:
         audio_data = example.get("audio")
-        if not audio_data or "array" not in audio_data:
-            return {"prompt": None, "ref_tokens": None}
-        
-        # Encode reference audio
-        ref_tokens = encode_audio_to_tokens(audio_data["array"], audio_data["sampling_rate"])
-        
-        # Limit reference audio length (max ~5 seconds = ~87 frames * 7 = 609 tokens)
-        max_ref_tokens = 609
-        if len(ref_tokens) > max_ref_tokens:
-            ref_tokens = ref_tokens[:max_ref_tokens]
+        if audio_data and "array" in audio_data:
+            ref_tokens = encode_audio_to_tokens(audio_data["array"], audio_data["sampling_rate"])
+            # Limit reference audio length (max ~5 seconds)
+            max_ref_tokens = 609
+            if len(ref_tokens) > max_ref_tokens:
+                ref_tokens = ref_tokens[:max_ref_tokens]
+            if ref_tokens:
+                VOICE_PROMPT_TOKENS.append(ref_tokens)
+    except Exception as e:
+        print(f"Error encoding voice prompt {i}: {e}")
+    
+    if (i + 1) % 100 == 0:
+        print(f"Encoded {i + 1}/{len(voice_prompts_ds)} voice prompts")
+
+print(f"Total voice prompts available: {len(VOICE_PROMPT_TOKENS)}")
+
+def process_example(example, idx):
+    """
+    Create prompt with voice cloning format using random voice from voice_design dataset.
+    """
+    try:
+        # Pick a random voice prompt
+        ref_tokens = random.choice(VOICE_PROMPT_TOKENS)
         
         caption = example.get("caption", "")
         text = example.get("text", "")
@@ -276,7 +295,7 @@ def process_example(example):
         return {"prompt": None, "ref_tokens": None}
 
 print("Processing dataset...")
-dataset = dataset.map(process_example, remove_columns=["audio"])
+dataset = dataset.map(process_example, with_indices=True)
 dataset = dataset.filter(lambda x: x["prompt"] is not None and x["ref_tokens"] is not None)
 
 # Build prompt strings with reference audio tokens
@@ -285,10 +304,9 @@ def build_prompt_string(example):
     text = example["prompt"]
     
     # Convert ref tokens to token strings for the prompt
-    # The model will see these as special tokens
     ref_token_str = "".join([tokenizer.decode([t]) for t in ref_tokens])
     
-    # Format: Reference audio: <speech>tokens</speech> Text: {text}
+    # Format: Reference audio: {tokens} Text: {text}
     prompt_content = f"Reference audio: {ref_token_str} Text: {text}"
     
     return {
