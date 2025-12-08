@@ -277,77 +277,59 @@ else:
     print("Pre-encoding voice prompts (will be cached for next run)...")
     VOICE_PROMPT_TOKENS = []
     
-    # Process in batches for GPU efficiency
-    for batch_start in tqdm(range(0, len(voice_prompts_ds), ENCODE_BATCH_SIZE), desc="Encoding voice prompts"):
-        batch_end = min(batch_start + ENCODE_BATCH_SIZE, len(voice_prompts_ds))
-        batch = voice_prompts_ds[batch_start:batch_end]
-        
-        # Prepare batch: resample and pad/trim to same length
-        waveforms = []
-        valid_indices = []
-        
-        for i, audio_data in enumerate(batch["audio"]):
-            try:
-                if audio_data and "array" in audio_data:
-                    wav = torch.from_numpy(audio_data["array"]).to(dtype=torch.float32)
-                    sr = audio_data["sampling_rate"]
-                    
-                    # Resample if needed
-                    if sr != SAMPLE_RATE:
-                        resampler = T.Resample(orig_freq=sr, new_freq=SAMPLE_RATE)
-                        wav = resampler(wav)
-                    
-                    # Trim to max length
-                    if wav.shape[0] > MAX_REF_SAMPLES:
-                        wav = wav[:MAX_REF_SAMPLES]
-                    
-                    waveforms.append(wav)
-                    valid_indices.append(i)
-            except:
-                pass
-        
-        if not waveforms:
-            continue
-        
-        # Pad to same length for batching
-        max_len = max(w.shape[0] for w in waveforms)
-        padded = torch.zeros(len(waveforms), 1, max_len)
-        for i, wav in enumerate(waveforms):
-            padded[i, 0, :wav.shape[0]] = wav
-        
-        # Encode entire batch on GPU at once
-        padded = padded.to(DEVICE)
-        
-        with torch.inference_mode():
-            codes = snac_model.encode(padded)
-        
-        # Convert each sample's codes to tokens
-        c0 = codes[0].cpu().numpy()
-        c1 = codes[1].cpu().numpy()
-        c2 = codes[2].cpu().numpy()
-        
-        for b in range(len(waveforms)):
-            try:
-                all_codes = []
-                num_frames = c0.shape[2]
-                for i in range(num_frames):
-                    all_codes.extend([
-                        int(c0[b, 0, i]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[0],
-                        int(c1[b, 0, 2*i]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[1],
-                        int(c2[b, 0, 4*i]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[2],
-                        int(c2[b, 0, 4*i+1]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[3],
-                        int(c1[b, 0, 2*i+1]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[4],
-                        int(c2[b, 0, 4*i+2]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[5],
-                        int(c2[b, 0, 4*i+3]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[6]
-                    ])
+    # Process one at a time to avoid batching issues
+    for idx in tqdm(range(len(voice_prompts_ds)), desc="Encoding voice prompts"):
+        try:
+            audio_data = voice_prompts_ds[idx]["audio"]
+            if not audio_data or "array" not in audio_data:
+                continue
+            
+            wav = torch.from_numpy(audio_data["array"]).to(dtype=torch.float32)
+            sr = audio_data["sampling_rate"]
+            
+            # Resample if needed
+            if sr != SAMPLE_RATE:
+                resampler = T.Resample(orig_freq=sr, new_freq=SAMPLE_RATE)
+                wav = resampler(wav)
+            
+            # Trim to max length
+            if wav.shape[0] > MAX_REF_SAMPLES:
+                wav = wav[:MAX_REF_SAMPLES]
+            
+            # SNAC expects [batch, channels, time]
+            wav = wav.unsqueeze(0).unsqueeze(0).to(DEVICE)
+            
+            with torch.inference_mode():
+                codes = snac_model.encode(wav)
+            
+            # codes is a list of 3 tensors: [batch, time] for each layer
+            c0 = codes[0][0].cpu().numpy()  # [time]
+            c1 = codes[1][0].cpu().numpy()  # [time * 2]
+            c2 = codes[2][0].cpu().numpy()  # [time * 4]
+            
+            num_frames = len(c0)
+            all_codes = []
+            
+            for i in range(num_frames):
+                all_codes.extend([
+                    int(c0[i]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[0],
+                    int(c1[2*i]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[1],
+                    int(c2[4*i]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[2],
+                    int(c2[4*i+1]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[3],
+                    int(c1[2*i+1]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[4],
+                    int(c2[4*i+2]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[5],
+                    int(c2[4*i+3]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[6]
+                ])
+            
+            if len(all_codes) > MAX_REF_TOKENS:
+                all_codes = all_codes[:MAX_REF_TOKENS]
+            
+            if all_codes:
+                VOICE_PROMPT_TOKENS.append(all_codes)
                 
-                if len(all_codes) > MAX_REF_TOKENS:
-                    all_codes = all_codes[:MAX_REF_TOKENS]
-                
-                if all_codes:
-                    VOICE_PROMPT_TOKENS.append(all_codes)
-            except Exception as e:
-                pass
+        except Exception as e:
+            if idx < 5:  # Print first few errors for debugging
+                print(f"Error encoding voice prompt {idx}: {e}")
     
     # Save to cache
     print(f"Saving {len(VOICE_PROMPT_TOKENS)} voice prompts to cache...")
