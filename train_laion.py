@@ -53,6 +53,12 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
+# Ensure tokenizer has proper special tokens
+if tokenizer.eos_token_id is None:
+    tokenizer.eos_token_id = END_OF_TEXT
+if tokenizer.pad_token_id is None:
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+
 # =============================================================================
 # LOAD SNAC
 # =============================================================================
@@ -247,68 +253,122 @@ print("Loading datasets...")
 dataset = load_dataset(DATASET_NAME, split="train")
 
 # Load voice prompts dataset for random voice cloning references
-print("Loading voice prompts dataset...")
-voice_prompts_ds = load_dataset("mrfakename/voice_design", split="train")
-voice_prompts_ds = voice_prompts_ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
+import os
+import pickle
+from tqdm import tqdm
 
-# Pre-encode all voice prompts with batched GPU processing
-print("Pre-encoding voice prompts (batched)...")
+VOICE_CACHE_PATH = "voice_prompts_cache.pkl"
+MAX_REF_SECONDS = 5
+MAX_REF_SAMPLES = SAMPLE_RATE * MAX_REF_SECONDS
+MAX_REF_TOKENS = 609
+ENCODE_BATCH_SIZE = 64
 
-def encode_voice_prompts_batched(examples):
-    results = []
-    for audio_data in examples["audio"]:
-        try:
-            if audio_data and "array" in audio_data:
-                ref_tokens = encode_audio_to_tokens(audio_data["array"], audio_data["sampling_rate"])
-                max_ref_tokens = 609
-                if len(ref_tokens) > max_ref_tokens:
-                    ref_tokens = ref_tokens[:max_ref_tokens]
-                results.append(ref_tokens)
-            else:
-                results.append(None)
-        except Exception as e:
-            results.append(None)
-    return {"ref_tokens": results}
+# Try to load from cache first
+if os.path.exists(VOICE_CACHE_PATH):
+    print(f"Loading cached voice prompts from {VOICE_CACHE_PATH}...")
+    with open(VOICE_CACHE_PATH, "rb") as f:
+        VOICE_PROMPT_TOKENS = pickle.load(f)
+    print(f"Loaded {len(VOICE_PROMPT_TOKENS)} cached voice prompts")
+else:
+    print("Loading voice prompts dataset...")
+    voice_prompts_ds = load_dataset("mrfakename/voice_design", split="train")
+    voice_prompts_ds = voice_prompts_ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
+    
+    print("Pre-encoding voice prompts (will be cached for next run)...")
+    VOICE_PROMPT_TOKENS = []
+    
+    # Process in batches for GPU efficiency
+    for batch_start in tqdm(range(0, len(voice_prompts_ds), ENCODE_BATCH_SIZE), desc="Encoding voice prompts"):
+        batch_end = min(batch_start + ENCODE_BATCH_SIZE, len(voice_prompts_ds))
+        batch = voice_prompts_ds[batch_start:batch_end]
+        
+        # Prepare batch: resample and pad/trim to same length
+        waveforms = []
+        valid_indices = []
+        
+        for i, audio_data in enumerate(batch["audio"]):
+            try:
+                if audio_data and "array" in audio_data:
+                    wav = torch.from_numpy(audio_data["array"]).to(dtype=torch.float32)
+                    sr = audio_data["sampling_rate"]
+                    
+                    # Resample if needed
+                    if sr != SAMPLE_RATE:
+                        resampler = T.Resample(orig_freq=sr, new_freq=SAMPLE_RATE)
+                        wav = resampler(wav)
+                    
+                    # Trim to max length
+                    if wav.shape[0] > MAX_REF_SAMPLES:
+                        wav = wav[:MAX_REF_SAMPLES]
+                    
+                    waveforms.append(wav)
+                    valid_indices.append(i)
+            except:
+                pass
+        
+        if not waveforms:
+            continue
+        
+        # Pad to same length for batching
+        max_len = max(w.shape[0] for w in waveforms)
+        padded = torch.zeros(len(waveforms), 1, max_len)
+        for i, wav in enumerate(waveforms):
+            padded[i, 0, :wav.shape[0]] = wav
+        
+        # Encode entire batch on GPU at once
+        padded = padded.to(DEVICE)
+        
+        with torch.inference_mode():
+            codes = snac_model.encode(padded)
+        
+        # Convert each sample's codes to tokens
+        c0 = codes[0].cpu().numpy()
+        c1 = codes[1].cpu().numpy()
+        c2 = codes[2].cpu().numpy()
+        
+        for b in range(len(waveforms)):
+            try:
+                all_codes = []
+                num_frames = c0.shape[2]
+                for i in range(num_frames):
+                    all_codes.extend([
+                        int(c0[b, 0, i]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[0],
+                        int(c1[b, 0, 2*i]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[1],
+                        int(c2[b, 0, 4*i]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[2],
+                        int(c2[b, 0, 4*i+1]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[3],
+                        int(c1[b, 0, 2*i+1]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[4],
+                        int(c2[b, 0, 4*i+2]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[5],
+                        int(c2[b, 0, 4*i+3]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[6]
+                    ])
+                
+                if len(all_codes) > MAX_REF_TOKENS:
+                    all_codes = all_codes[:MAX_REF_TOKENS]
+                
+                if all_codes:
+                    VOICE_PROMPT_TOKENS.append(all_codes)
+            except Exception as e:
+                pass
+    
+    # Save to cache
+    print(f"Saving {len(VOICE_PROMPT_TOKENS)} voice prompts to cache...")
+    with open(VOICE_CACHE_PATH, "wb") as f:
+        pickle.dump(VOICE_PROMPT_TOKENS, f)
 
-voice_prompts_ds = voice_prompts_ds.map(
-    encode_voice_prompts_batched,
-    batched=True,
-    batch_size=32,
-    desc="Encoding voice prompts",
-)
-voice_prompts_ds = voice_prompts_ds.filter(lambda x: x["ref_tokens"] is not None)
-
-VOICE_PROMPT_TOKENS = voice_prompts_ds["ref_tokens"]
 print(f"Total voice prompts available: {len(VOICE_PROMPT_TOKENS)}")
 
-def process_example(example, idx):
+if len(VOICE_PROMPT_TOKENS) == 0:
+    raise ValueError("No voice prompts were encoded! Check the voice_design dataset.")
+
+def process_example(example):
     """
     Create prompt with voice cloning format using random voice from voice_design dataset.
     """
-    try:
-        # Pick a random voice prompt
-        ref_tokens = random.choice(VOICE_PROMPT_TOKENS)
-        
-        caption = example.get("caption", "")
-        text = example.get("text", "")
-        full_text = f"{caption} {text}" if caption else text
-        
-        return {
-            "prompt": full_text,
-            "ref_tokens": ref_tokens,
-        }
-    except Exception as e:
-        print(f"Error processing example: {e}")
-        return {"prompt": None, "ref_tokens": None}
-
-print("Processing dataset...")
-dataset = dataset.map(process_example, with_indices=True)
-dataset = dataset.filter(lambda x: x["prompt"] is not None and x["ref_tokens"] is not None)
-
-# Build prompt strings with reference audio tokens
-def build_prompt_string(example):
-    ref_tokens = example["ref_tokens"]
-    text = example["prompt"]
+    # Pick a random voice prompt
+    ref_tokens = random.choice(VOICE_PROMPT_TOKENS)
+    
+    caption = example.get("caption", "")
+    text = example.get("text", "")
+    full_text = f"{caption} {text}" if caption else text
     
     # Convert ref tokens to token strings for the prompt
     ref_token_str = "".join([tokenizer.decode([t]) for t in ref_tokens])
@@ -318,12 +378,23 @@ def build_prompt_string(example):
     
     return {
         "prompt": [{"role": "user", "content": prompt_content}],
-        "expected_text": text,
+        "expected_text": full_text,
     }
 
-dataset = dataset.map(build_prompt_string, remove_columns=["ref_tokens"])
+print("Processing dataset...")
+print(f"Dataset columns: {dataset.column_names}")
+print(f"Dataset size before processing: {len(dataset)}")
 
-print(f"Dataset size: {len(dataset)}")
+# Check first example
+if len(dataset) > 0:
+    print(f"First example keys: {dataset[0].keys()}")
+
+dataset = dataset.map(process_example)
+
+print(f"Dataset size after processing: {len(dataset)}")
+
+if len(dataset) == 0:
+    raise ValueError("Dataset is empty after processing!")
 
 # =============================================================================
 # GLOBAL STATE FOR REWARDS
