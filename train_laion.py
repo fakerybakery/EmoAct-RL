@@ -51,13 +51,27 @@ model = AutoModelForCausalLM.from_pretrained(
     torch_dtype=torch.bfloat16,
     device_map="auto",
 )
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
 
 # Ensure tokenizer has proper special tokens
 if tokenizer.eos_token_id is None:
     tokenizer.eos_token_id = END_OF_TEXT
 if tokenizer.pad_token_id is None:
     tokenizer.pad_token_id = tokenizer.eos_token_id
+
+# Disable token_type_ids (not used by this model) - force override
+tokenizer.model_input_names = ['input_ids', 'attention_mask']
+
+# Patch __call__ to remove token_type_ids
+_original_tokenizer_call = tokenizer.__class__.__call__
+def _patched_call(self, *args, **kwargs):
+    result = _original_tokenizer_call(self, *args, **kwargs)
+    if hasattr(result, 'pop'):
+        result.pop('token_type_ids', None)
+    elif isinstance(result, dict):
+        result.pop('token_type_ids', None)
+    return result
+tokenizer.__class__.__call__ = _patched_call
 
 # =============================================================================
 # LOAD SNAC
@@ -302,23 +316,19 @@ else:
             with torch.inference_mode():
                 codes = snac_model.encode(wav)
             
-            # codes is a list of 3 tensors: [batch, time] for each layer
-            c0 = codes[0][0].cpu().numpy()  # [time]
-            c1 = codes[1][0].cpu().numpy()  # [time * 2]
-            c2 = codes[2][0].cpu().numpy()  # [time * 4]
-            
-            num_frames = len(c0)
+            # codes is a list of 3 tensors, access like codes[layer][batch][time]
+            num_frames = codes[0].shape[1]
             all_codes = []
             
             for i in range(num_frames):
                 all_codes.extend([
-                    int(c0[i]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[0],
-                    int(c1[2*i]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[1],
-                    int(c2[4*i]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[2],
-                    int(c2[4*i+1]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[3],
-                    int(c1[2*i+1]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[4],
-                    int(c2[4*i+2]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[5],
-                    int(c2[4*i+3]) + TOKEN_OFFSET_BASE + LAYER_OFFSETS[6]
+                    codes[0][0][i].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[0],
+                    codes[1][0][2*i].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[1],
+                    codes[2][0][4*i].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[2],
+                    codes[2][0][4*i+1].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[3],
+                    codes[1][0][2*i+1].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[4],
+                    codes[2][0][4*i+2].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[5],
+                    codes[2][0][4*i+3].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[6]
                 ])
             
             if len(all_codes) > MAX_REF_TOKENS:
