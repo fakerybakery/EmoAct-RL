@@ -272,9 +272,9 @@ import pickle
 from tqdm import tqdm
 
 VOICE_CACHE_PATH = "voice_prompts_cache.pkl"
-MAX_REF_SECONDS = 5
-MAX_REF_SAMPLES = SAMPLE_RATE * MAX_REF_SECONDS
-MAX_REF_TOKENS = 609
+MAX_REF_SECONDS = 1.5  # Shorter reference = faster training
+MAX_REF_SAMPLES = int(SAMPLE_RATE * MAX_REF_SECONDS)
+MAX_REF_TOKENS = 175  # ~1.5 seconds of audio
 ENCODE_BATCH_SIZE = 64
 
 # Try to load from cache first
@@ -362,8 +362,8 @@ def process_example(example):
     text = example.get("text", "")
     full_text = f"{caption} {text}" if caption else text
     
-    # Convert ref tokens to token strings for the prompt
-    ref_token_str = "".join([tokenizer.decode([t]) for t in ref_tokens])
+    # Convert ref tokens to token strings for the prompt (batch decode is faster)
+    ref_token_str = tokenizer.decode(ref_tokens, skip_special_tokens=False)
     
     # Format: Reference audio: {tokens} Text: {text}
     prompt_content = f"Reference audio: {ref_token_str} Text: {text}"
@@ -558,8 +558,8 @@ training_args = GRPOConfig(
     output_dir="outputs_laion",
     bf16=True,
 
-    num_generations=4,
-    max_prompt_length=4096,  # Longer for reference audio
+    num_generations=2,  # Fewer generations = faster
+    max_prompt_length=2048,
     max_completion_length=2048,
 
     temperature=0.8,
