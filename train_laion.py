@@ -22,11 +22,17 @@ from audiobox_aesthetics.infer import initialize_predictor
 # =============================================================================
 # CONFIG
 # =============================================================================
+import os
+
 MODEL_NAME = "ChristophSchuhmann/Vocalino_0.11_alpha"
 DATASET_NAME = "mrfakename/emoact_prompts_with_language"
-DEVICE = "cuda"
 MAX_SEQ_LENGTH = 4096
 SAMPLE_RATE = 24000
+
+# Multi-GPU support: use LOCAL_RANK to determine device
+LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
+DEVICE = f"cuda:{LOCAL_RANK}"
+print(f"[Rank {LOCAL_RANK}] Using device: {DEVICE}")
 
 # =============================================================================
 # SPECIAL TOKENS (LAION format)
@@ -85,11 +91,11 @@ snac_model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").to(DEVICE)
 # =============================================================================
 print("Loading reward models...")
 
-# ASR for WER
+# ASR for WER - use device index for pipeline compatibility
 asr_pipe = pipeline(
     "automatic-speech-recognition",
     model="openai/whisper-large-v3-turbo",
-    device=DEVICE,
+    device=LOCAL_RANK,  # Pipeline expects device index, not string
     torch_dtype=torch.bfloat16,
 )
 
@@ -179,7 +185,9 @@ def filter_valid_audio_tokens(token_ids):
     valid = valid[:(len(valid) // 7) * 7]
     return valid
 
-def prepare_snac_codes(token_ids, device="cuda"):
+def prepare_snac_codes(token_ids, device=None):
+    if device is None:
+        device = DEVICE
     if isinstance(token_ids, torch.Tensor):
         token_ids = token_ids.tolist()
     
@@ -251,7 +259,7 @@ def decode_tokens_to_audio(token_ids, chunk_size=700):
                     audio = audio.unsqueeze(1)
                 segments.append(audio.cpu())
         except Exception as e:
-            print(f"SNAC decode error: {e}")
+            print(f"[Rank {LOCAL_RANK}] SNAC decode error: {e}")
             continue
     
     if not segments:
@@ -278,49 +286,72 @@ MAX_REF_SAMPLES = int(SAMPLE_RATE * MAX_REF_SECONDS)
 MAX_REF_TOKENS = 175  # ~1.5 seconds of audio
 ENCODE_BATCH_SIZE = 64
 
-# Try to load from cache first
-if os.path.exists(VOICE_CACHE_PATH):
-    print(f"Loading cached voice prompts from {VOICE_CACHE_PATH}...")
-    with open(VOICE_CACHE_PATH, "rb") as f:
-        VOICE_PROMPT_TOKENS = pickle.load(f)
-    print(f"Loaded {len(VOICE_PROMPT_TOKENS)} cached voice prompts")
-else:
-    print("Loading voice prompts dataset...")
+# For multi-GPU: only rank 0 creates the cache, others wait and load
+import torch.distributed as dist
+IS_DISTRIBUTED = dist.is_initialized()
+IS_MAIN_PROCESS = LOCAL_RANK == 0
+
+def load_or_create_voice_cache():
+    """Load voice prompts from cache or create if needed (rank 0 only creates)."""
+    global VOICE_PROMPT_TOKENS
+
+    # If cache exists, all ranks can load it
+    if os.path.exists(VOICE_CACHE_PATH):
+        print(f"[Rank {LOCAL_RANK}] Loading cached voice prompts from {VOICE_CACHE_PATH}...")
+        with open(VOICE_CACHE_PATH, "rb") as f:
+            VOICE_PROMPT_TOKENS = pickle.load(f)
+        print(f"[Rank {LOCAL_RANK}] Loaded {len(VOICE_PROMPT_TOKENS)} cached voice prompts")
+        return
+
+    # Cache doesn't exist - only rank 0 creates it
+    if not IS_MAIN_PROCESS:
+        print(f"[Rank {LOCAL_RANK}] Waiting for rank 0 to create voice cache...")
+        # Wait for rank 0 to create the cache
+        if IS_DISTRIBUTED:
+            dist.barrier()
+        # Now load the cache that rank 0 created
+        with open(VOICE_CACHE_PATH, "rb") as f:
+            VOICE_PROMPT_TOKENS = pickle.load(f)
+        print(f"[Rank {LOCAL_RANK}] Loaded {len(VOICE_PROMPT_TOKENS)} cached voice prompts")
+        return
+
+    # Rank 0: create the cache
+    print("[Rank 0] Loading voice prompts dataset...")
     voice_prompts_ds = load_dataset("mrfakename/voice_design", split="train")
     voice_prompts_ds = voice_prompts_ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
-    
-    print("Pre-encoding voice prompts (will be cached for next run)...")
+
+    print("[Rank 0] Pre-encoding voice prompts (will be cached for next run)...")
     VOICE_PROMPT_TOKENS = []
-    
+
     # Process one at a time to avoid batching issues
     for idx in tqdm(range(len(voice_prompts_ds)), desc="Encoding voice prompts"):
         try:
             audio_data = voice_prompts_ds[idx]["audio"]
             if not audio_data or "array" not in audio_data:
                 continue
-            
+
             wav = torch.from_numpy(audio_data["array"]).to(dtype=torch.float32)
             sr = audio_data["sampling_rate"]
-            
+
             # Resample if needed
             if sr != SAMPLE_RATE:
                 resampler = T.Resample(orig_freq=sr, new_freq=SAMPLE_RATE)
                 wav = resampler(wav)
-            
+
             # Trim to max length
             if wav.shape[0] > MAX_REF_SAMPLES:
                 wav = wav[:MAX_REF_SAMPLES]
-            
+
             # SNAC expects [batch, channels, time]
             wav = wav.unsqueeze(0).unsqueeze(0).to(DEVICE)
-            
+
             with torch.inference_mode():
                 codes = snac_model.encode(wav)
-            
+
             # codes is a list of 3 tensors, access like codes[layer][batch][time]
             num_frames = codes[0].shape[1]
             all_codes = []
-            
+
             for i in range(num_frames):
                 all_codes.extend([
                     codes[0][0][i].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[0],
@@ -331,31 +362,50 @@ else:
                     codes[2][0][4*i+2].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[5],
                     codes[2][0][4*i+3].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[6]
                 ])
-            
+
             if len(all_codes) > MAX_REF_TOKENS:
                 all_codes = all_codes[:MAX_REF_TOKENS]
-            
+
             if all_codes:
                 VOICE_PROMPT_TOKENS.append(all_codes)
-                
+
         except Exception as e:
             if idx < 5:  # Print first few errors for debugging
-                print(f"Error encoding voice prompt {idx}: {e}")
-    
+                print(f"[Rank {LOCAL_RANK}] Error encoding voice prompt {idx}: {e}")
+
     # Save to cache
-    print(f"Saving {len(VOICE_PROMPT_TOKENS)} voice prompts to cache...")
+    print(f"[Rank 0] Saving {len(VOICE_PROMPT_TOKENS)} voice prompts to cache...")
     with open(VOICE_CACHE_PATH, "wb") as f:
         pickle.dump(VOICE_PROMPT_TOKENS, f)
 
-print(f"Total voice prompts available: {len(VOICE_PROMPT_TOKENS)}")
+    # Signal other ranks that cache is ready
+    if IS_DISTRIBUTED:
+        dist.barrier()
 
-if len(VOICE_PROMPT_TOKENS) == 0:
-    raise ValueError("No voice prompts were encoded! Check the voice_design dataset.")
+# Load the cache (defer to main block to handle distributed init)
+VOICE_PROMPT_TOKENS = []
+
+def ensure_voice_prompts_loaded():
+    """Ensure voice prompts are loaded, called after distributed init."""
+    if len(VOICE_PROMPT_TOKENS) == 0:
+        load_or_create_voice_cache()
+
+# Try loading immediately if cache exists (non-distributed or cache already exists)
+if os.path.exists(VOICE_CACHE_PATH):
+    with open(VOICE_CACHE_PATH, "rb") as f:
+        VOICE_PROMPT_TOKENS = pickle.load(f)
+    print(f"[Rank {LOCAL_RANK}] Pre-loaded {len(VOICE_PROMPT_TOKENS)} cached voice prompts")
+else:
+    print(f"[Rank {LOCAL_RANK}] Voice cache not found, will be created/loaded during training")
 
 def process_example(example):
     """
     Create prompt with voice cloning format using random voice from voice_design dataset.
     """
+    # Ensure voice prompts are loaded
+    if len(VOICE_PROMPT_TOKENS) == 0:
+        raise ValueError("Voice prompts not loaded! Ensure cache exists or run on rank 0 first.")
+
     # Pick a random voice prompt
     ref_tokens = random.choice(VOICE_PROMPT_TOKENS)
     
@@ -455,9 +505,10 @@ def wer_reward(prompts, completions, **kwargs):
                 scores.append(-5.0 - invalid_penalty)
                 GLOBAL_AUDIO.append(None)
                 continue
-            
-            GLOBAL_AUDIO.append(audio)
-            
+
+            # Store on CPU to avoid cross-device issues in subsequent reward functions
+            GLOBAL_AUDIO.append(audio.cpu())
+
             audio_np = audio.squeeze().cpu().numpy()
             result = asr_pipe(audio_np, return_timestamps=True)
             transcribed = result["text"]
@@ -468,7 +519,7 @@ def wer_reward(prompts, completions, **kwargs):
             scores.append(final_score)
             
         except Exception as e:
-            print(f"WER error: {e}")
+            print(f"[Rank {LOCAL_RANK}] WER error: {e}")
             scores.append(-5.0 - invalid_penalty)
             GLOBAL_AUDIO.append(None)
     
@@ -496,31 +547,33 @@ def whisperclap_reward(prompts, completions, **kwargs):
         if audio is None:
             scores.append(-1.0)
             continue
-        
+
         try:
+            # Move audio from CPU to the correct device for this rank
             audio_24k = audio.squeeze().to(DEVICE)
             audio_16k = RESAMPLER_24_TO_16(audio_24k)
             audio_emb = get_clap_audio_embedding(audio_16k)
             similarity = torch.matmul(audio_emb, text_emb.t()).item()
             scores.append(similarity)
         except Exception as e:
-            print(f"CLAP error: {e}")
+            print(f"[Rank {LOCAL_RANK}] CLAP error: {e}")
             scores.append(-1.0)
-    
+
     return scores
 
 def audiobox_reward(prompts, completions, **kwargs):
     scores = []
-    
+
     valid_audios = [(i, audio) for i, audio in enumerate(GLOBAL_AUDIO) if audio is not None]
-    
+
     if not valid_audios:
         GLOBAL_AUDIO.clear()
         return [-1.0] * len(completions)
-    
+
     try:
+        # Move audio to CPU for audiobox predictor (it handles its own device placement)
         predictions = audiobox_predictor.forward([
-            {"path": audio.squeeze().unsqueeze(0), "sample_rate": 24000}
+            {"path": audio.squeeze().unsqueeze(0).cpu(), "sample_rate": 24000}
             for _, audio in valid_audios
         ])
         
@@ -535,7 +588,7 @@ def audiobox_reward(prompts, completions, **kwargs):
                 scores.append(-1.0)
                 
     except Exception as e:
-        print(f"Audiobox error: {e}")
+        print(f"[Rank {LOCAL_RANK}] Audiobox error: {e}")
         scores = [-1.0] * len(completions)
     
     GLOBAL_AUDIO.clear()
