@@ -1,3 +1,19 @@
+"""
+Stage 2: GRPO to improve reasoning and audio quality.
+
+Run this AFTER stage1_sft.py has taught the model the reasoning format.
+
+This script:
+1. Loads the SFT'd model from stage 1
+2. Uses GRPO with rewards for:
+   - Correct reasoning format
+   - Good reasoning length
+   - Reasoning quality (mentions relevant concepts)
+   - WER (speech accuracy)
+   - CLAP (audio-text alignment)
+   - Audiobox (audio quality)
+"""
+
 import re
 import torch
 import torch.nn as nn
@@ -25,16 +41,35 @@ from audiobox_aesthetics.infer import initialize_predictor
 import os
 import time
 
-BASE_MODEL_NAME = "ChristophSchuhmann/Vocalino_0.11_alpha"
-LOCAL_MODEL_PATH = "./vocalino_ct"  # Local copy with chat template
+# Load from stage 1 SFT output
+SFT_MODEL_PATH = "outputs_reasoning_sft/final"
+LOCAL_MODEL_PATH = "./vocalino_reasoning_ct"  # Local copy with chat template
 DATASET_NAME = "mrfakename/emoact_prompts_with_language"
 MAX_SEQ_LENGTH = 4096
 SAMPLE_RATE = 24000
 
-# Multi-GPU support: use LOCAL_RANK to determine device
+# Multi-GPU support
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
 DEVICE = f"cuda:{LOCAL_RANK}"
 print(f"[Rank {LOCAL_RANK}] Using device: {DEVICE}")
+
+# =============================================================================
+# SPECIAL TOKENS
+# =============================================================================
+TOKEN_OFFSET_BASE = 128266
+LAYER_OFFSETS = [0, 4096, 8192, 12288, 16384, 20480, 24576]
+
+START_OF_SPEECH = 128257
+END_OF_SPEECH = 128258
+START_OF_HUMAN = 128259
+END_OF_HUMAN = 128260
+START_OF_AI = 128261
+END_OF_AI = 128262
+END_OF_TEXT = 128009
+
+# Reasoning markers
+REASONING_START = "<start_of_reasoning>"
+REASONING_END = "<end_of_reasoning>"
 
 # =============================================================================
 # PREPARE LOCAL MODEL WITH CHAT TEMPLATE (for vLLM compatibility)
@@ -50,20 +85,16 @@ def prepare_local_model():
     if LOCAL_RANK == 0:
         print(f"[Rank 0] Preparing local model with chat template...")
 
-        # Load model and tokenizer
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        model_tmp = AutoModelForCausalLM.from_pretrained(BASE_MODEL_NAME, torch_dtype=torch.bfloat16)
-        tokenizer_tmp = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
+        model_tmp = AutoModelForCausalLM.from_pretrained(SFT_MODEL_PATH, torch_dtype=torch.bfloat16)
+        tokenizer_tmp = AutoTokenizer.from_pretrained(SFT_MODEL_PATH)
 
         # Set chat template
         tokenizer_tmp.chat_template = """{% for message in messages %}{{ message['content'] }}{% endfor %}"""
 
-        # Save locally
         os.makedirs(LOCAL_MODEL_PATH, exist_ok=True)
         model_tmp.save_pretrained(LOCAL_MODEL_PATH)
         tokenizer_tmp.save_pretrained(LOCAL_MODEL_PATH)
 
-        # Create marker file to signal completion
         with open(marker_file, "w") as f:
             f.write("ready")
 
@@ -71,51 +102,32 @@ def prepare_local_model():
         del model_tmp, tokenizer_tmp
         torch.cuda.empty_cache()
     else:
-        # Wait for rank 0 to finish
         print(f"[Rank {LOCAL_RANK}] Waiting for rank 0 to prepare local model...")
         while not os.path.exists(marker_file):
             time.sleep(1)
         print(f"[Rank {LOCAL_RANK}] Local model ready")
 
 prepare_local_model()
-MODEL_NAME = LOCAL_MODEL_PATH  # Use local model for training
+MODEL_NAME = LOCAL_MODEL_PATH
 
 # =============================================================================
-# SPECIAL TOKENS (LAION format)
-# =============================================================================
-TOKEN_OFFSET_BASE = 128266
-LAYER_OFFSETS = [0, 4096, 8192, 12288, 16384, 20480, 24576]
-
-START_OF_SPEECH = 128257
-END_OF_SPEECH = 128258
-START_OF_HUMAN = 128259
-END_OF_HUMAN = 128260
-START_OF_AI = 128261
-END_OF_AI = 128262
-END_OF_TEXT = 128009
-
-# =============================================================================
-# LOAD BASE MODEL (with FSDP support)
+# LOAD BASE MODEL
 # =============================================================================
 print("Loading model for FSDP training...")
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     torch_dtype=torch.bfloat16,
-    # Don't use device_map with FSDP - let FSDP handle distribution
-    use_cache=False,  # Required for gradient checkpointing with FSDP
+    use_cache=False,
 )
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
 
-# Ensure tokenizer has proper special tokens
 if tokenizer.eos_token_id is None:
     tokenizer.eos_token_id = END_OF_TEXT
 if tokenizer.pad_token_id is None:
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-# Disable token_type_ids (not used by this model) - force override
 tokenizer.model_input_names = ['input_ids', 'attention_mask']
 
-# Patch __call__ to remove token_type_ids
 _original_tokenizer_call = tokenizer.__class__.__call__
 def _patched_call(self, *args, **kwargs):
     result = _original_tokenizer_call(self, *args, **kwargs)
@@ -126,7 +138,8 @@ def _patched_call(self, *args, **kwargs):
     return result
 tokenizer.__class__.__call__ = _patched_call
 
-# Chat template is already in the local model (saved by prepare_local_model)
+REASONING_START_IDS = tokenizer.encode(REASONING_START, add_special_tokens=False)
+REASONING_END_IDS = tokenizer.encode(REASONING_END, add_special_tokens=False)
 
 # =============================================================================
 # LOAD SNAC
@@ -139,7 +152,6 @@ snac_model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").to(DEVICE)
 # =============================================================================
 print("Loading reward models...")
 
-# ASR for WER - use large model for best quality (H100s can handle it)
 asr_pipe = pipeline(
     "automatic-speech-recognition",
     model="openai/whisper-large-v3-turbo",
@@ -147,7 +159,6 @@ asr_pipe = pipeline(
     torch_dtype=torch.bfloat16,
 )
 
-# Whisper-CLAP
 class WhisperClapModel(nn.Module):
     def __init__(self, whisper_name):
         super().__init__()
@@ -175,53 +186,17 @@ clap_feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper
 clap_tokenizer = AutoTokenizer.from_pretrained("Alibaba-NLP/gte-base-en-v1.5")
 clap_text_model = AutoModel.from_pretrained("Alibaba-NLP/gte-base-en-v1.5", trust_remote_code=True).to(DEVICE).eval()
 
-# Audiobox Aesthetics - always runs on cuda:0 (hardcoded in library)
 audiobox_predictor = initialize_predictor()
 
-# Resampler for CLAP (24kHz -> 16kHz)
 RESAMPLER_24_TO_16 = T.Resample(orig_freq=24000, new_freq=16000).to(DEVICE)
 
 # =============================================================================
-# AUDIO ENCODING (for voice cloning reference)
+# AUDIO DECODING
 # =============================================================================
 SNAC_VOCAB_SIZE = 4096
 AUDIO_TOKEN_START = TOKEN_OFFSET_BASE
 AUDIO_TOKEN_END = AUDIO_TOKEN_START + (7 * SNAC_VOCAB_SIZE)
 
-def encode_audio_to_tokens(waveform, orig_sr):
-    """Encode audio waveform to SNAC tokens for voice cloning reference."""
-    waveform = torch.from_numpy(waveform).unsqueeze(0).to(dtype=torch.float32)
-    
-    if orig_sr != SAMPLE_RATE:
-        resampler = T.Resample(orig_freq=orig_sr, new_freq=SAMPLE_RATE)
-        waveform = resampler(waveform)
-    
-    waveform = waveform.unsqueeze(0).to(DEVICE)
-    
-    with torch.inference_mode():
-        codes = snac_model.encode(waveform)
-    
-    c0 = codes[0].cpu().numpy()[0]
-    c1 = codes[1].cpu().numpy()[0]
-    c2 = codes[2].cpu().numpy()[0]
-    
-    all_codes = []
-    for i in range(codes[0].shape[1]):
-        all_codes.extend([
-            c0[i] + TOKEN_OFFSET_BASE + LAYER_OFFSETS[0],
-            c1[2*i] + TOKEN_OFFSET_BASE + LAYER_OFFSETS[1],
-            c2[4*i] + TOKEN_OFFSET_BASE + LAYER_OFFSETS[2],
-            c2[4*i+1] + TOKEN_OFFSET_BASE + LAYER_OFFSETS[3],
-            c1[2*i+1] + TOKEN_OFFSET_BASE + LAYER_OFFSETS[4],
-            c2[4*i+2] + TOKEN_OFFSET_BASE + LAYER_OFFSETS[5],
-            c2[4*i+3] + TOKEN_OFFSET_BASE + LAYER_OFFSETS[6]
-        ])
-    
-    return all_codes
-
-# =============================================================================
-# AUDIO DECODING (for reward computation)
-# =============================================================================
 def is_valid_audio_token(token_id):
     return AUDIO_TOKEN_START <= token_id < AUDIO_TOKEN_END
 
@@ -238,18 +213,17 @@ def prepare_snac_codes(token_ids, device=None):
         device = DEVICE
     if isinstance(token_ids, torch.Tensor):
         token_ids = token_ids.tolist()
-    
+
     token_ids = filter_valid_audio_tokens(token_ids)
-    
+
     if len(token_ids) < 7:
         empty = torch.tensor([], dtype=torch.long, device=device).unsqueeze(0)
         return [empty.clone(), empty.clone(), empty.clone()]
-    
+
     layer_1, layer_2, layer_3 = [], [], []
-    
+
     for i in range(len(token_ids) // 7):
         base = 7 * i
-        
         l1_val = token_ids[base] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[0]
         l2_val_a = token_ids[base + 1] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[1]
         l3_val_a = token_ids[base + 2] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[2]
@@ -257,23 +231,19 @@ def prepare_snac_codes(token_ids, device=None):
         l2_val_b = token_ids[base + 4] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[4]
         l3_val_c = token_ids[base + 5] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[5]
         l3_val_d = token_ids[base + 6] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[6]
-        
+
         all_vals = [l1_val, l2_val_a, l2_val_b, l3_val_a, l3_val_b, l3_val_c, l3_val_d]
         if not all(0 <= v < SNAC_VOCAB_SIZE for v in all_vals):
             continue
-        
+
         layer_1.append(l1_val)
-        layer_2.append(l2_val_a)
-        layer_2.append(l2_val_b)
-        layer_3.append(l3_val_a)
-        layer_3.append(l3_val_b)
-        layer_3.append(l3_val_c)
-        layer_3.append(l3_val_d)
-    
+        layer_2.extend([l2_val_a, l2_val_b])
+        layer_3.extend([l3_val_a, l3_val_b, l3_val_c, l3_val_d])
+
     if not layer_1:
         empty = torch.tensor([], dtype=torch.long, device=device).unsqueeze(0)
         return [empty.clone(), empty.clone(), empty.clone()]
-    
+
     return [
         torch.tensor(layer_1, dtype=torch.long, device=device).unsqueeze(0),
         torch.tensor(layer_2, dtype=torch.long, device=device).unsqueeze(0),
@@ -283,23 +253,23 @@ def prepare_snac_codes(token_ids, device=None):
 def decode_tokens_to_audio(token_ids, chunk_size=700):
     if isinstance(token_ids, torch.Tensor):
         token_ids = token_ids.tolist()
-    
+
     if not token_ids:
         return None
-    
+
     token_ids = filter_valid_audio_tokens(token_ids)
-    
+
     if len(token_ids) < 7:
         return None
-    
+
     segments = []
     for i in range(0, len(token_ids), chunk_size):
         chunk = token_ids[i:i + chunk_size]
         codes = prepare_snac_codes(chunk, device=DEVICE)
-        
+
         if codes[0].numel() == 0:
             continue
-        
+
         try:
             with torch.no_grad():
                 audio = snac_model.decode(codes)
@@ -309,197 +279,70 @@ def decode_tokens_to_audio(token_ids, chunk_size=700):
         except Exception as e:
             print(f"[Rank {LOCAL_RANK}] SNAC decode error: {e}")
             continue
-    
+
     if not segments:
         return None
-    
+
     return torch.cat(segments, dim=2)
 
 # =============================================================================
 # DATASET PREPARATION
 # =============================================================================
 import random
+import pickle
 
 print("Loading datasets...")
 dataset = load_dataset(DATASET_NAME, split="train")
 
-# Load voice prompts dataset for random voice cloning references
-import os
-import pickle
-from tqdm import tqdm
-
+# Load voice prompts cache
 VOICE_CACHE_PATH = "voice_prompts_cache.pkl"
-MAX_REF_SECONDS = 1.5  # Shorter reference = faster training
-MAX_REF_SAMPLES = int(SAMPLE_RATE * MAX_REF_SECONDS)
-MAX_REF_TOKENS = 175  # ~1.5 seconds of audio
-ENCODE_BATCH_SIZE = 64
 
-# For multi-GPU: only rank 0 creates the cache, others wait and load
-import torch.distributed as dist
-IS_DISTRIBUTED = dist.is_initialized()
-IS_MAIN_PROCESS = LOCAL_RANK == 0
-
-def load_or_create_voice_cache():
-    """Load voice prompts from cache or create if needed (rank 0 only creates)."""
-    global VOICE_PROMPT_TOKENS
-
-    # If cache exists, all ranks can load it
-    if os.path.exists(VOICE_CACHE_PATH):
-        print(f"[Rank {LOCAL_RANK}] Loading cached voice prompts from {VOICE_CACHE_PATH}...")
-        with open(VOICE_CACHE_PATH, "rb") as f:
-            VOICE_PROMPT_TOKENS = pickle.load(f)
-        print(f"[Rank {LOCAL_RANK}] Loaded {len(VOICE_PROMPT_TOKENS)} cached voice prompts")
-        return
-
-    # Cache doesn't exist - only rank 0 creates it
-    if not IS_MAIN_PROCESS:
-        print(f"[Rank {LOCAL_RANK}] Waiting for rank 0 to create voice cache...")
-        # Wait for rank 0 to create the cache
-        if IS_DISTRIBUTED:
-            dist.barrier()
-        # Now load the cache that rank 0 created
-        with open(VOICE_CACHE_PATH, "rb") as f:
-            VOICE_PROMPT_TOKENS = pickle.load(f)
-        print(f"[Rank {LOCAL_RANK}] Loaded {len(VOICE_PROMPT_TOKENS)} cached voice prompts")
-        return
-
-    # Rank 0: create the cache
-    print("[Rank 0] Loading voice prompts dataset...")
-    voice_prompts_ds = load_dataset("mrfakename/voice_design", split="train")
-    voice_prompts_ds = voice_prompts_ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
-
-    print("[Rank 0] Pre-encoding voice prompts (will be cached for next run)...")
-    VOICE_PROMPT_TOKENS = []
-
-    # Process one at a time to avoid batching issues
-    for idx in tqdm(range(len(voice_prompts_ds)), desc="Encoding voice prompts"):
-        try:
-            audio_data = voice_prompts_ds[idx]["audio"]
-            if not audio_data or "array" not in audio_data:
-                continue
-
-            wav = torch.from_numpy(audio_data["array"]).to(dtype=torch.float32)
-            sr = audio_data["sampling_rate"]
-
-            # Resample if needed
-            if sr != SAMPLE_RATE:
-                resampler = T.Resample(orig_freq=sr, new_freq=SAMPLE_RATE)
-                wav = resampler(wav)
-
-            # Trim to max length
-            if wav.shape[0] > MAX_REF_SAMPLES:
-                wav = wav[:MAX_REF_SAMPLES]
-
-            # SNAC expects [batch, channels, time]
-            wav = wav.unsqueeze(0).unsqueeze(0).to(DEVICE)
-
-            with torch.inference_mode():
-                codes = snac_model.encode(wav)
-
-            # codes is a list of 3 tensors, access like codes[layer][batch][time]
-            num_frames = codes[0].shape[1]
-            all_codes = []
-
-            for i in range(num_frames):
-                all_codes.extend([
-                    codes[0][0][i].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[0],
-                    codes[1][0][2*i].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[1],
-                    codes[2][0][4*i].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[2],
-                    codes[2][0][4*i+1].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[3],
-                    codes[1][0][2*i+1].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[4],
-                    codes[2][0][4*i+2].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[5],
-                    codes[2][0][4*i+3].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[6]
-                ])
-
-            if len(all_codes) > MAX_REF_TOKENS:
-                all_codes = all_codes[:MAX_REF_TOKENS]
-
-            if all_codes:
-                VOICE_PROMPT_TOKENS.append(all_codes)
-
-        except Exception as e:
-            if idx < 5:  # Print first few errors for debugging
-                print(f"[Rank {LOCAL_RANK}] Error encoding voice prompt {idx}: {e}")
-
-    # Save to cache
-    print(f"[Rank 0] Saving {len(VOICE_PROMPT_TOKENS)} voice prompts to cache...")
-    with open(VOICE_CACHE_PATH, "wb") as f:
-        pickle.dump(VOICE_PROMPT_TOKENS, f)
-
-    # Signal other ranks that cache is ready
-    if IS_DISTRIBUTED:
-        dist.barrier()
-
-# Load the cache (defer to main block to handle distributed init)
-VOICE_PROMPT_TOKENS = []
-
-def ensure_voice_prompts_loaded():
-    """Ensure voice prompts are loaded, called after distributed init."""
-    if len(VOICE_PROMPT_TOKENS) == 0:
-        load_or_create_voice_cache()
-
-# Try loading immediately if cache exists (non-distributed or cache already exists)
 if os.path.exists(VOICE_CACHE_PATH):
     with open(VOICE_CACHE_PATH, "rb") as f:
         VOICE_PROMPT_TOKENS = pickle.load(f)
-    print(f"[Rank {LOCAL_RANK}] Pre-loaded {len(VOICE_PROMPT_TOKENS)} cached voice prompts")
+    print(f"[Rank {LOCAL_RANK}] Loaded {len(VOICE_PROMPT_TOKENS)} cached voice prompts")
 else:
-    print(f"[Rank {LOCAL_RANK}] Voice cache not found, will be created/loaded during training")
+    raise ValueError(f"Voice cache not found at {VOICE_CACHE_PATH}. Run train_laion.py first to create it.")
 
 def process_example(example):
     """
-    Create prompt matching sft.py format:
-    <START_OF_HUMAN><start_of_caption>{caption}<end_of_caption>{text}<END_OF_TEXT><END_OF_HUMAN><START_OF_AI><START_OF_SPEECH>{ref_audio_tokens}
+    Create prompt for reasoning TTS.
+    Model will generate: reasoning + audio tokens
     """
-    # Ensure voice prompts are loaded
-    if len(VOICE_PROMPT_TOKENS) == 0:
-        raise ValueError("Voice prompts not loaded! Ensure cache exists or run on rank 0 first.")
-
-    # Pick a random voice prompt for voice cloning
     ref_tokens = random.choice(VOICE_PROMPT_TOKENS)
 
     caption = example.get("caption", "")
     text = example.get("text", "")
 
-    # Tokenize the text part: <start_of_caption>{caption}<end_of_caption>{text}
     text_content = f"<start_of_caption>{caption}<end_of_caption>{text}"
     text_ids = tokenizer.encode(text_content, add_special_tokens=False)
 
-    # Build full prompt token sequence (model continues from here)
+    # Prompt ends with <start_of_reasoning>, model generates from there
     prompt_ids = (
         [START_OF_HUMAN]
         + text_ids
         + [END_OF_TEXT, END_OF_HUMAN]
-        + [START_OF_AI, START_OF_SPEECH]
-        + ref_tokens  # Reference audio for voice cloning
+        + [START_OF_AI]
+        + REASONING_START_IDS
     )
 
     return {
-        "prompt": prompt_ids,  # Token IDs directly
-        "expected_text": text,  # For WER comparison
-        "caption": caption,  # For CLAP comparison
+        "prompt": prompt_ids,
+        "expected_text": text,
+        "caption": caption,
+        "ref_tokens": ref_tokens,
     }
 
 print("Processing dataset...")
-print(f"Dataset columns: {dataset.column_names}")
-print(f"Dataset size before processing: {len(dataset)}")
-
-# Check first example
-if len(dataset) > 0:
-    print(f"First example keys: {dataset[0].keys()}")
-
 dataset = dataset.map(process_example)
-
-print(f"Dataset size after processing: {len(dataset)}")
-
-if len(dataset) == 0:
-    raise ValueError("Dataset is empty after processing!")
+print(f"Dataset size: {len(dataset)}")
 
 # =============================================================================
 # GLOBAL STATE FOR REWARDS
 # =============================================================================
 GLOBAL_AUDIO = []
 GLOBAL_EXPECTED_TEXT = []
+GLOBAL_REASONING = []
 
 # =============================================================================
 # REWARD FUNCTIONS
@@ -527,38 +370,149 @@ def get_clap_audio_embedding(waveform_16k):
 
 INVALID_TOKEN_PENALTY = 0.1
 
+REASONING_PATTERN = re.compile(
+    rf"(.*?){re.escape(REASONING_END)}",
+    re.DOTALL
+)
+
+def extract_reasoning_and_audio(content):
+    """Extract reasoning text and audio tokens from model completion."""
+    reasoning_match = REASONING_PATTERN.search(content)
+    reasoning_text = reasoning_match.group(1).strip() if reasoning_match else ""
+
+    audio_pattern = r"<custom_token_\d+>"
+    tokens = re.findall(audio_pattern, content)
+    codes = tokenizer.encode("".join(tokens))[1:] if tokens else []
+
+    return reasoning_text, codes
+
+def reasoning_format_reward(prompts, completions, **kwargs):
+    """Reward for correct format: reasoning + audio."""
+    scores = []
+    for completion in completions:
+        content = completion[0]["content"]
+        score = 0.0
+
+        if REASONING_END in content:
+            score += 1.5
+        else:
+            score -= 2.0
+
+        if "<custom_token_" in content:
+            score += 1.5
+        else:
+            score -= 1.0
+
+        scores.append(score)
+    return scores
+
+def reasoning_length_reward(prompts, completions, **kwargs):
+    """Reward good reasoning length (50-150 words optimal)."""
+    scores = []
+    for completion in completions:
+        content = completion[0]["content"]
+        reasoning_text, _ = extract_reasoning_and_audio(content)
+
+        if not reasoning_text:
+            scores.append(-1.0)
+            continue
+
+        word_count = len(reasoning_text.split())
+
+        if word_count < 10:
+            score = -1.0
+        elif word_count < 30:
+            score = 0.5 * (word_count / 30)
+        elif word_count <= 150:
+            score = 1.0
+        elif word_count <= 300:
+            score = 1.0 - 0.5 * ((word_count - 150) / 150)
+        else:
+            score = 0.0
+
+        scores.append(score)
+    return scores
+
+def reasoning_quality_reward(prompts, completions, caption, **kwargs):
+    """Reward reasoning that mentions relevant concepts."""
+    caption_text = caption[0] if isinstance(caption, list) else caption
+    if not caption_text:
+        return [0.0] * len(completions)
+
+    caption_lower = caption_text.lower()
+
+    # Emotion keywords
+    emotion_keywords = {
+        "happy": ["happy", "joy", "cheerful", "bright", "upbeat", "smile", "excited"],
+        "sad": ["sad", "melancholy", "somber", "down", "grief", "sorrow", "mournful"],
+        "angry": ["angry", "fury", "rage", "intense", "forceful", "aggressive", "harsh"],
+        "calm": ["calm", "peaceful", "serene", "gentle", "soft", "relaxed", "soothing"],
+        "fearful": ["fear", "scared", "anxious", "nervous", "trembling", "worried"],
+        "surprised": ["surprise", "shock", "astonish", "unexpected", "amazed"],
+    }
+
+    relevant_keywords = []
+    for emotion, keywords in emotion_keywords.items():
+        if any(kw in caption_lower for kw in keywords):
+            relevant_keywords.extend(keywords)
+
+    # Prosody terms always relevant
+    prosody_terms = ["pace", "speed", "slow", "fast", "emphasis", "stress",
+                    "pitch", "tone", "volume", "loud", "soft", "pause", "breath",
+                    "energy", "intensity", "voice", "delivery"]
+
+    scores = []
+    for completion in completions:
+        content = completion[0]["content"]
+        reasoning_text, _ = extract_reasoning_and_audio(content)
+
+        if not reasoning_text:
+            scores.append(-0.5)
+            continue
+
+        reasoning_lower = reasoning_text.lower()
+
+        matches = sum(1 for kw in relevant_keywords if kw in reasoning_lower)
+        prosody_matches = sum(1 for term in prosody_terms if term in reasoning_lower)
+
+        score = min(1.5, matches * 0.3 + prosody_matches * 0.15)
+        scores.append(score)
+
+    return scores
+
 def wer_reward(prompts, completions, expected_text, **kwargs):
+    """WER reward for speech accuracy."""
     GLOBAL_AUDIO.clear()
     GLOBAL_EXPECTED_TEXT.clear()
+    GLOBAL_REASONING.clear()
 
-    # expected_text is passed directly from the dataset
-    GLOBAL_EXPECTED_TEXT.append(expected_text[0] if isinstance(expected_text, list) else expected_text)
+    exp_text = expected_text[0] if isinstance(expected_text, list) else expected_text
+    GLOBAL_EXPECTED_TEXT.append(exp_text)
 
-    # Debug: log first completion to see what model generates
     if LOCAL_RANK == 0 and len(completions) > 0:
         first_content = completions[0][0]["content"]
-        print(f"[DEBUG] First completion ({len(first_content)} chars): {first_content[:200]}...")
+        print(f"[DEBUG] First completion ({len(first_content)} chars): {first_content[:500]}...")
 
-    pattern = r"<custom_token_\d+>"
     scores = []
 
     for idx, completion in enumerate(completions):
         content = completion[0]["content"]
-        tokens = re.findall(pattern, content)
-        codes = tokenizer.encode("".join(tokens))[1:] if tokens else []
+        reasoning_text, codes = extract_reasoning_and_audio(content)
 
-        # Debug: log token extraction
+        GLOBAL_REASONING.append(reasoning_text)
+
         if LOCAL_RANK == 0 and idx == 0:
-            print(f"[DEBUG] Found {len(tokens)} custom_tokens, {len(codes)} codes")
-        
+            print(f"[DEBUG] Reasoning ({len(reasoning_text)} chars): {reasoning_text[:200]}..." if reasoning_text else "[DEBUG] No reasoning")
+            print(f"[DEBUG] Found {len(codes)} audio codes")
+
         if not codes:
             scores.append(-5.0)
             GLOBAL_AUDIO.append(None)
             continue
-        
+
         num_invalid = count_invalid_tokens(codes)
         invalid_penalty = num_invalid * INVALID_TOKEN_PENALTY
-        
+
         try:
             audio = decode_tokens_to_audio(codes)
             if audio is None:
@@ -566,34 +520,33 @@ def wer_reward(prompts, completions, expected_text, **kwargs):
                 GLOBAL_AUDIO.append(None)
                 continue
 
-            # Store on CPU to avoid cross-device issues in subsequent reward functions
             GLOBAL_AUDIO.append(audio.cpu())
 
             audio_np = audio.squeeze().cpu().numpy()
             result = asr_pipe(audio_np, return_timestamps=True)
             transcribed = result["text"]
-            
-            wer_score = compute_wer(expected_text.lower(), transcribed.lower())
+
+            wer_score = compute_wer(exp_text.lower(), transcribed.lower())
             accuracy = max(0, 1 - wer_score)
             final_score = accuracy - invalid_penalty
             scores.append(final_score)
-            
+
         except Exception as e:
             print(f"[Rank {LOCAL_RANK}] WER error: {e}")
             scores.append(-5.0 - invalid_penalty)
             GLOBAL_AUDIO.append(None)
-    
+
     return scores
 
 def whisperclap_reward(prompts, completions, caption, **kwargs):
-    # caption is passed directly from the dataset
+    """CLAP reward for audio-emotion alignment."""
     caption_text = caption[0] if isinstance(caption, list) else caption
 
     if not caption_text:
         return [0.0] * len(completions)
 
     text_emb = get_clap_text_embedding(caption_text)
-    
+
     scores = []
     for audio in GLOBAL_AUDIO:
         if audio is None:
@@ -601,7 +554,6 @@ def whisperclap_reward(prompts, completions, caption, **kwargs):
             continue
 
         try:
-            # Move audio from CPU to the correct device for this rank
             audio_24k = audio.squeeze().to(DEVICE)
             audio_16k = RESAMPLER_24_TO_16(audio_24k)
             audio_emb = get_clap_audio_embedding(audio_16k)
@@ -614,6 +566,7 @@ def whisperclap_reward(prompts, completions, caption, **kwargs):
     return scores
 
 def audiobox_reward(prompts, completions, **kwargs):
+    """Audio quality reward."""
     scores = []
 
     valid_audios = [(i, audio) for i, audio in enumerate(GLOBAL_AUDIO) if audio is not None]
@@ -623,14 +576,13 @@ def audiobox_reward(prompts, completions, **kwargs):
         return [-1.0] * len(completions)
 
     try:
-        # Audiobox predictor always uses cuda:0 - move audio there explicitly
         predictions = audiobox_predictor.forward([
             {"path": audio.squeeze().unsqueeze(0).to("cuda:0"), "sample_rate": 24000}
             for _, audio in valid_audios
         ])
-        
+
         pred_dict = {valid_audios[i][0]: pred for i, pred in enumerate(predictions)}
-        
+
         for i in range(len(completions)):
             if i in pred_dict:
                 pq = pred_dict[i]["PQ"]
@@ -638,16 +590,16 @@ def audiobox_reward(prompts, completions, **kwargs):
                 scores.append(score)
             else:
                 scores.append(-1.0)
-                
+
     except Exception as e:
         print(f"[Rank {LOCAL_RANK}] Audiobox error: {e}")
         scores = [-1.0] * len(completions)
-    
+
     GLOBAL_AUDIO.clear()
     return scores
 
 # =============================================================================
-# TRAINING CONFIG WITH FSDP
+# TRAINING CONFIG
 # =============================================================================
 training_args = GRPOConfig(
     learning_rate=1e-5,
@@ -656,38 +608,35 @@ training_args = GRPOConfig(
     lr_scheduler_type="cosine",
     optim="adamw_torch",
     logging_steps=1,
-    per_device_train_batch_size=2,  # H100s can handle more
+    per_device_train_batch_size=2,
     gradient_accumulation_steps=4,
     num_train_epochs=1,
     save_steps=100,
     report_to="wandb",
-    output_dir="outputs_laion",
+    output_dir="outputs_reasoning_grpo",
     bf16=True,
+    run_name="vocalino_reasoning_grpo",
 
-    num_generations=4,  # More generations = better reward signal
+    num_generations=4,
     max_prompt_length=2048,
     max_completion_length=2048,
 
-    # Sampling parameters (same for both vLLM and HF generate)
     temperature=0.8,
     top_p=0.95,
-    top_k=50,  # vLLM needs an int, not None
+    top_k=50,
     min_p=0.1,
 
-    # vLLM uses different param names than HF generate
     generation_kwargs={
         "stop_token_ids": [END_OF_SPEECH, tokenizer.eos_token_id],
     },
 
-    # vLLM for fast generation (3-5x speedup)
     use_vllm=True,
-    vllm_mode="colocate",  # Share GPU with training (vs "server" mode)
-    vllm_gpu_memory_utilization=0.4,  # Low since reward models take ~30GB
-    vllm_max_model_length=3000,  # Reduced from 4096 to fit in KV cache
-    vllm_tensor_parallel_size=1,  # Each GPU runs its own vLLM instance
-    vllm_enable_sleep_mode=True,  # Offload vLLM weights during backward pass
+    vllm_mode="colocate",
+    vllm_gpu_memory_utilization=0.4,
+    vllm_max_model_length=3000,
+    vllm_tensor_parallel_size=1,
+    vllm_enable_sleep_mode=True,
 
-    # FSDP Configuration for training
     fsdp="full_shard auto_wrap",
     fsdp_config={
         "fsdp_transformer_layer_cls_to_wrap": ["LlamaDecoderLayer"],
@@ -699,7 +648,6 @@ training_args = GRPOConfig(
         "fsdp_sync_module_states": True,
     },
 
-    # Gradient checkpointing for memory efficiency with FSDP
     gradient_checkpointing=True,
     gradient_checkpointing_kwargs={"use_reentrant": False},
 )
@@ -710,7 +658,14 @@ training_args = GRPOConfig(
 trainer = GRPOTrainer(
     model=model,
     processing_class=tokenizer,
-    reward_funcs=[wer_reward, whisperclap_reward, audiobox_reward],
+    reward_funcs=[
+        reasoning_format_reward,      # Format correctness
+        reasoning_length_reward,      # Good reasoning length
+        reasoning_quality_reward,     # Mentions relevant concepts
+        wer_reward,                   # Speech accuracy
+        whisperclap_reward,           # Audio-emotion alignment
+        audiobox_reward,              # Audio quality
+    ],
     args=training_args,
     train_dataset=dataset,
 )
@@ -719,7 +674,10 @@ trainer = GRPOTrainer(
 # TRAIN
 # =============================================================================
 if __name__ == "__main__":
+    print("Starting GRPO training...")
+    print("Make sure you ran stage1_sft.py first!")
     trainer.train()
-    
-    model.save_pretrained("outputs_laion/final")
-    tokenizer.save_pretrained("outputs_laion/final")
+
+    model.save_pretrained("outputs_reasoning_grpo/final")
+    tokenizer.save_pretrained("outputs_reasoning_grpo/final")
+    print("Done! Model saved to outputs_reasoning_grpo/final")

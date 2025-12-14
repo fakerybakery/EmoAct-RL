@@ -214,3 +214,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+reasoning_sft_dataset/
+reasoning_sft_data.json
