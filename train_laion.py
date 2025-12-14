@@ -23,8 +23,10 @@ from audiobox_aesthetics.infer import initialize_predictor
 # CONFIG
 # =============================================================================
 import os
+import time
 
-MODEL_NAME = "ChristophSchuhmann/Vocalino_0.11_alpha"
+BASE_MODEL_NAME = "ChristophSchuhmann/Vocalino_0.11_alpha"
+LOCAL_MODEL_PATH = "./vocalino_ct"  # Local copy with chat template
 DATASET_NAME = "mrfakename/emoact_prompts_with_language"
 MAX_SEQ_LENGTH = 4096
 SAMPLE_RATE = 24000
@@ -33,6 +35,50 @@ SAMPLE_RATE = 24000
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
 DEVICE = f"cuda:{LOCAL_RANK}"
 print(f"[Rank {LOCAL_RANK}] Using device: {DEVICE}")
+
+# =============================================================================
+# PREPARE LOCAL MODEL WITH CHAT TEMPLATE (for vLLM compatibility)
+# =============================================================================
+def prepare_local_model():
+    """Save model + tokenizer with chat template locally. Only rank 0 does this."""
+    marker_file = os.path.join(LOCAL_MODEL_PATH, ".ready")
+
+    if os.path.exists(marker_file):
+        print(f"[Rank {LOCAL_RANK}] Local model already exists at {LOCAL_MODEL_PATH}")
+        return
+
+    if LOCAL_RANK == 0:
+        print(f"[Rank 0] Preparing local model with chat template...")
+
+        # Load model and tokenizer
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        model_tmp = AutoModelForCausalLM.from_pretrained(BASE_MODEL_NAME, torch_dtype=torch.bfloat16)
+        tokenizer_tmp = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
+
+        # Set chat template
+        tokenizer_tmp.chat_template = """{% for message in messages %}{{ message['content'] }}{% endfor %}"""
+
+        # Save locally
+        os.makedirs(LOCAL_MODEL_PATH, exist_ok=True)
+        model_tmp.save_pretrained(LOCAL_MODEL_PATH)
+        tokenizer_tmp.save_pretrained(LOCAL_MODEL_PATH)
+
+        # Create marker file to signal completion
+        with open(marker_file, "w") as f:
+            f.write("ready")
+
+        print(f"[Rank 0] Saved model with chat template to {LOCAL_MODEL_PATH}")
+        del model_tmp, tokenizer_tmp
+        torch.cuda.empty_cache()
+    else:
+        # Wait for rank 0 to finish
+        print(f"[Rank {LOCAL_RANK}] Waiting for rank 0 to prepare local model...")
+        while not os.path.exists(marker_file):
+            time.sleep(1)
+        print(f"[Rank {LOCAL_RANK}] Local model ready")
+
+prepare_local_model()
+MODEL_NAME = LOCAL_MODEL_PATH  # Use local model for training
 
 # =============================================================================
 # SPECIAL TOKENS (LAION format)
@@ -79,6 +125,8 @@ def _patched_call(self, *args, **kwargs):
         result.pop('token_type_ids', None)
     return result
 tokenizer.__class__.__call__ = _patched_call
+
+# Chat template is already in the local model (saved by prepare_local_model)
 
 # =============================================================================
 # LOAD SNAC
@@ -616,19 +664,26 @@ training_args = GRPOConfig(
     max_prompt_length=2048,
     max_completion_length=2048,
 
+    # Sampling parameters (same for both vLLM and HF generate)
     temperature=0.8,
     top_p=0.95,
-    top_k=None,
+    top_k=50,  # vLLM needs an int, not None
     min_p=0.1,
 
+    # vLLM uses different param names than HF generate
     generation_kwargs={
-        "pad_token_id": tokenizer.eos_token_id,
-        "eos_token_id": END_OF_SPEECH,
+        "stop_token_ids": [END_OF_SPEECH, tokenizer.eos_token_id],
     },
 
-    use_vllm=False,
-    
-    # FSDP Configuration
+    # vLLM for fast generation (3-5x speedup)
+    use_vllm=True,
+    vllm_mode="colocate",  # Share GPU with training (vs "server" mode)
+    vllm_gpu_memory_utilization=0.4,  # Low since reward models take ~30GB
+    vllm_max_model_length=3000,  # Reduced from 4096 to fit in KV cache
+    vllm_tensor_parallel_size=1,  # Each GPU runs its own vLLM instance
+    vllm_enable_sleep_mode=True,  # Offload vLLM weights during backward pass
+
+    # FSDP Configuration for training
     fsdp="full_shard auto_wrap",
     fsdp_config={
         "fsdp_transformer_layer_cls_to_wrap": ["LlamaDecoderLayer"],
@@ -639,7 +694,7 @@ training_args = GRPOConfig(
         "fsdp_state_dict_type": "SHARDED_STATE_DICT",
         "fsdp_sync_module_states": True,
     },
-    
+
     # Gradient checkpointing for memory efficiency with FSDP
     gradient_checkpointing=True,
     gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -648,12 +703,6 @@ training_args = GRPOConfig(
 # =============================================================================
 # TRAINER
 # =============================================================================
-tokenizer.chat_template = """
-{% for message in messages %}
-{{ message['content'] }}
-{% endfor %}
-"""
-
 trainer = GRPOTrainer(
     model=model,
     processing_class=tokenizer,
