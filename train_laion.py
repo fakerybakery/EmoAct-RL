@@ -22,7 +22,7 @@ from audiobox_aesthetics.infer import initialize_predictor
 # =============================================================================
 # CONFIG
 # =============================================================================
-MODEL_NAME = "ChristophSchuhmann/checkpoint-6260"
+MODEL_NAME = "ChristophSchuhmann/Vocalino_0.11_alpha"
 DATASET_NAME = "mrfakename/emoact_prompts_with_language"
 DEVICE = "cuda"
 MAX_SEQ_LENGTH = 4096
@@ -43,13 +43,14 @@ END_OF_AI = 128262
 END_OF_TEXT = 128009
 
 # =============================================================================
-# LOAD BASE MODEL (FFT)
+# LOAD BASE MODEL (with FSDP support)
 # =============================================================================
-print("Loading model for full fine-tuning...")
+print("Loading model for FSDP training...")
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     torch_dtype=torch.bfloat16,
-    device_map="auto",
+    # Don't use device_map with FSDP - let FSDP handle distribution
+    use_cache=False,  # Required for gradient checkpointing with FSDP
 )
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
 
@@ -541,7 +542,7 @@ def audiobox_reward(prompts, completions, **kwargs):
     return scores
 
 # =============================================================================
-# TRAINING CONFIG
+# TRAINING CONFIG WITH FSDP
 # =============================================================================
 training_args = GRPOConfig(
     learning_rate=1e-5,
@@ -573,6 +574,22 @@ training_args = GRPOConfig(
     },
 
     use_vllm=False,
+    
+    # FSDP Configuration
+    fsdp="full_shard auto_wrap",
+    fsdp_config={
+        "fsdp_transformer_layer_cls_to_wrap": ["LlamaDecoderLayer"],
+        "fsdp_backward_prefetch": "backward_pre",
+        "fsdp_forward_prefetch": True,
+        "fsdp_use_orig_params": True,
+        "fsdp_cpu_ram_efficient_loading": True,
+        "fsdp_state_dict_type": "SHARDED_STATE_DICT",
+        "fsdp_sync_module_states": True,
+    },
+    
+    # Gradient checkpointing for memory efficiency with FSDP
+    gradient_checkpointing=True,
+    gradient_checkpointing_kwargs={"use_reentrant": False},
 )
 
 # =============================================================================
@@ -600,4 +617,3 @@ if __name__ == "__main__":
     
     model.save_pretrained("outputs_laion/final")
     tokenizer.save_pretrained("outputs_laion/final")
-
