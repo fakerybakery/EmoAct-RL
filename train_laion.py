@@ -91,11 +91,11 @@ snac_model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").to(DEVICE)
 # =============================================================================
 print("Loading reward models...")
 
-# ASR for WER - use device index for pipeline compatibility
+# ASR for WER - use large model for best quality (H100s can handle it)
 asr_pipe = pipeline(
     "automatic-speech-recognition",
     model="openai/whisper-large-v3-turbo",
-    device=LOCAL_RANK,  # Pipeline expects device index, not string
+    device=LOCAL_RANK,
     torch_dtype=torch.bfloat16,
 )
 
@@ -448,25 +448,25 @@ GLOBAL_EXPECTED_TEXT = []
 # =============================================================================
 # REWARD FUNCTIONS
 # =============================================================================
+@torch.inference_mode()
 def get_clap_text_embedding(text):
     inputs = clap_tokenizer(text, max_length=512, padding=True, truncation=True, return_tensors="pt").to(DEVICE)
-    with torch.no_grad():
-        outputs = clap_text_model(**inputs)
-        mask = inputs.attention_mask.unsqueeze(-1).expand(outputs.last_hidden_state.size()).float()
-        sum_emb = torch.sum(outputs.last_hidden_state * mask, 1)
-        sum_mask = torch.clamp(mask.sum(1), min=1e-9)
-        return F.normalize(sum_emb / sum_mask, p=2, dim=1)
+    outputs = clap_text_model(**inputs)
+    mask = inputs.attention_mask.unsqueeze(-1).expand(outputs.last_hidden_state.size()).float()
+    sum_emb = torch.sum(outputs.last_hidden_state * mask, 1)
+    sum_mask = torch.clamp(mask.sum(1), min=1e-9)
+    return F.normalize(sum_emb / sum_mask, p=2, dim=1)
 
+@torch.inference_mode()
 def get_clap_audio_embedding(waveform_16k):
     target_len = 16000 * 30
     if waveform_16k.shape[0] > target_len:
         waveform_16k = waveform_16k[:target_len]
     elif waveform_16k.shape[0] < target_len:
         waveform_16k = F.pad(waveform_16k, (0, target_len - waveform_16k.shape[0]))
-    
+
     inputs = clap_feature_extractor(waveform_16k.cpu().numpy(), sampling_rate=16000, return_tensors="pt")
-    with torch.no_grad():
-        emb = clap_audio_model(inputs.input_features.to(DEVICE))
+    emb = clap_audio_model(inputs.input_features.to(DEVICE))
     return emb
 
 INVALID_TOKEN_PENALTY = 0.1
@@ -604,7 +604,7 @@ training_args = GRPOConfig(
     lr_scheduler_type="cosine",
     optim="adamw_torch",
     logging_steps=1,
-    per_device_train_batch_size=1,
+    per_device_train_batch_size=2,  # H100s can handle more
     gradient_accumulation_steps=4,
     num_train_epochs=1,
     save_steps=100,
@@ -612,7 +612,7 @@ training_args = GRPOConfig(
     output_dir="outputs_laion",
     bf16=True,
 
-    num_generations=2,  # Fewer generations = faster
+    num_generations=4,  # More generations = better reward signal
     max_prompt_length=2048,
     max_completion_length=2048,
 
