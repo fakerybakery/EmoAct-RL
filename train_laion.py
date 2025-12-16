@@ -455,8 +455,11 @@ def process_example(example):
     if len(VOICE_PROMPT_TOKENS) == 0:
         raise ValueError("Voice prompts not loaded! Ensure cache exists or run on rank 0 first.")
 
-    # Pick a random voice prompt for voice cloning
-    ref_tokens = random.choice(VOICE_PROMPT_TOKENS)
+    # Pick a random voice prompt for voice cloning (50% of the time)
+    if random.random() < 0.5:
+        ref_tokens = random.choice(VOICE_PROMPT_TOKENS)
+    else:
+        ref_tokens = []  # No voice prompt - model learns to generate without cloning
 
     caption = example.get("caption", "")
     text = example.get("text", "")

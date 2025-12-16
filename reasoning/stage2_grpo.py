@@ -59,13 +59,7 @@ print(f"[Rank {LOCAL_RANK}] Using device: {DEVICE}")
 TOKEN_OFFSET_BASE = 128266
 LAYER_OFFSETS = [0, 4096, 8192, 12288, 16384, 20480, 24576]
 
-START_OF_SPEECH = 128257
 END_OF_SPEECH = 128258
-START_OF_HUMAN = 128259
-END_OF_HUMAN = 128260
-START_OF_AI = 128261
-END_OF_AI = 128262
-END_OF_TEXT = 128009
 
 # Reasoning markers
 REASONING_START = "<start_of_reasoning>"
@@ -288,49 +282,39 @@ def decode_tokens_to_audio(token_ids, chunk_size=700):
 # =============================================================================
 # DATASET PREPARATION
 # =============================================================================
-import random
-import pickle
-
 print("Loading datasets...")
 dataset = load_dataset(DATASET_NAME, split="train")
 
-# Load voice prompts cache
-VOICE_CACHE_PATH = "voice_prompts_cache.pkl"
-
-if os.path.exists(VOICE_CACHE_PATH):
-    with open(VOICE_CACHE_PATH, "rb") as f:
-        VOICE_PROMPT_TOKENS = pickle.load(f)
-    print(f"[Rank {LOCAL_RANK}] Loaded {len(VOICE_PROMPT_TOKENS)} cached voice prompts")
-else:
-    raise ValueError(f"Voice cache not found at {VOICE_CACHE_PATH}. Run train_laion.py first to create it.")
-
 def process_example(example):
     """
-    Create prompt for reasoning TTS.
-    Model will generate: reasoning + audio tokens
-    """
-    ref_tokens = random.choice(VOICE_PROMPT_TOKENS)
+    Create prompt for reasoning TTS using chat template format.
+    Model will generate: reasoning + <end_of_reasoning> + text + audio tokens
 
+    Format: {voice}: <start_of_caption>{caption}<end_of_caption><start_of_reasoning>
+    Model generates: {reasoning}<end_of_reasoning>{text}<audio_tokens>
+    """
     caption = example.get("caption", "")
     text = example.get("text", "")
 
-    text_content = f"<start_of_caption>{caption}<end_of_caption>{text}"
-    text_ids = tokenizer.encode(text_content, add_special_tokens=False)
+    # Use default voice for GRPO (could randomize if needed)
+    voice = "tara"
 
-    # Prompt ends with <start_of_reasoning>, model generates from there
-    prompt_ids = (
-        [START_OF_HUMAN]
-        + text_ids
-        + [END_OF_TEXT, END_OF_HUMAN]
-        + [START_OF_AI]
-        + REASONING_START_IDS
+    # Build prompt in same format as SFT training
+    # Model will generate reasoning, then the text, then audio
+    prompt_content = f"{voice}: <start_of_caption>{caption}<end_of_caption>{REASONING_START}"
+
+    # Use chat template
+    messages = [{"role": "user", "content": prompt_content}]
+    prompt_ids = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
     )
 
     return {
         "prompt": prompt_ids,
         "expected_text": text,
         "caption": caption,
-        "ref_tokens": ref_tokens,
     }
 
 print("Processing dataset...")
