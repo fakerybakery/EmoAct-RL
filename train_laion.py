@@ -1,28 +1,29 @@
+import json
+import os
 import re
+import tempfile
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio.transforms as T
+import soundfile as sf
 from datasets import Audio, load_dataset
 from snac import SNAC
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     AutoModel,
-    WhisperModel,
-    WhisperFeatureExtractor,
     pipeline,
 )
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 from trl import GRPOConfig, GRPOTrainer
-from jiwer import wer as compute_wer
+from jiwer import wer as compute_wer, cer as compute_cer
 from audiobox_aesthetics.infer import initialize_predictor
+from majestrino_tagger import MajestrinoTagger
 
 # =============================================================================
 # CONFIG
 # =============================================================================
-import os
 import time
 
 BASE_MODEL_NAME = "ChristophSchuhmann/Vocalino_0.11_alpha"
@@ -147,39 +148,20 @@ asr_pipe = pipeline(
     torch_dtype=torch.bfloat16,
 )
 
-# Whisper-CLAP
-class WhisperClapModel(nn.Module):
-    def __init__(self, whisper_name):
-        super().__init__()
-        self.audio_encoder = WhisperModel.from_pretrained(whisper_name).encoder
-        self.projector = nn.Sequential(
-            nn.Linear(768, 2048),
-            nn.GELU(),
-            nn.Linear(2048, 768)
-        )
+# Majestrino Tagger for audio tagging
+print(f"[Rank {LOCAL_RANK}] Loading MajestrinoTagger...")
+majestrino_tagger = MajestrinoTagger.from_pretrained()
+majestrino_tagger.load_tags()
+print(f"[Rank {LOCAL_RANK}] MajestrinoTagger loaded")
 
-    def forward(self, input_features):
-        outputs = self.audio_encoder(input_features)
-        rep = outputs.last_hidden_state.mean(dim=1)
-        emb = self.projector(rep)
-        return F.normalize(emb, p=2, dim=1)
-
-clap_audio_model = WhisperClapModel("openai/whisper-small").to(DEVICE)
-clap_weights = hf_hub_download(repo_id="laion/whisper-clap-version-0.1", filename="model.safetensors")
-clap_state = load_file(clap_weights)
-clap_state = {k.replace("model.", ""): v for k, v in clap_state.items()}
-clap_audio_model.load_state_dict(clap_state, strict=False)
-clap_audio_model.eval()
-
-clap_feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small")
-clap_tokenizer = AutoTokenizer.from_pretrained("Alibaba-NLP/gte-base-en-v1.5")
-clap_text_model = AutoModel.from_pretrained("Alibaba-NLP/gte-base-en-v1.5", trust_remote_code=True).to(DEVICE).eval()
+# GTE text encoder for computing similarity between tags and caption
+print(f"[Rank {LOCAL_RANK}] Loading GTE text encoder...")
+gte_tokenizer = AutoTokenizer.from_pretrained("Alibaba-NLP/gte-base-en-v1.5")
+gte_model = AutoModel.from_pretrained("Alibaba-NLP/gte-base-en-v1.5", trust_remote_code=True).to(DEVICE).eval()
+print(f"[Rank {LOCAL_RANK}] GTE loaded")
 
 # Audiobox Aesthetics - always runs on cuda:0 (hardcoded in library)
 audiobox_predictor = initialize_predictor()
-
-# Resampler for CLAP (24kHz -> 16kHz)
-RESAMPLER_24_TO_16 = T.Resample(orig_freq=24000, new_freq=16000).to(DEVICE)
 
 # =============================================================================
 # AUDIO ENCODING (for voice cloning reference)
@@ -324,137 +306,44 @@ print("Loading datasets...")
 dataset = load_dataset(DATASET_NAME, split="train")
 
 # Load voice prompts dataset for random voice cloning references
-import os
 import pickle
-from tqdm import tqdm
 
 VOICE_CACHE_PATH = "voice_prompts_cache.pkl"
+VOICE_EMOTION_GRID_PATH = "voice_emotion_grid.jsonl"
 MAX_REF_SECONDS = 1.5  # Shorter reference = faster training
 MAX_REF_SAMPLES = int(SAMPLE_RATE * MAX_REF_SECONDS)
 MAX_REF_TOKENS = 175  # ~1.5 seconds of audio
 ENCODE_BATCH_SIZE = 64
 
-# For multi-GPU: only rank 0 creates the cache, others wait and load
-import torch.distributed as dist
-IS_DISTRIBUTED = dist.is_initialized()
-IS_MAIN_PROCESS = LOCAL_RANK == 0
+# Load voice emotion grid for caption augmentation
+VOICE_EMOTION_DESCRIPTIONS = []
+if os.path.exists(VOICE_EMOTION_GRID_PATH):
+    print(f"[Rank {LOCAL_RANK}] Loading voice emotion grid from {VOICE_EMOTION_GRID_PATH}...")
+    with open(VOICE_EMOTION_GRID_PATH, "r") as f:
+        for line in f:
+            record = json.loads(line)
+            VOICE_EMOTION_DESCRIPTIONS.append(record["description"])
+    print(f"[Rank {LOCAL_RANK}] Loaded {len(VOICE_EMOTION_DESCRIPTIONS)} voice emotion descriptions")
+else:
+    print(f"[Rank {LOCAL_RANK}] Warning: {VOICE_EMOTION_GRID_PATH} not found. Run var.py first to generate it.")
 
-def load_or_create_voice_cache():
-    """Load voice prompts from cache or create if needed (rank 0 only creates)."""
-    global VOICE_PROMPT_TOKENS
-
-    # If cache exists, all ranks can load it
-    if os.path.exists(VOICE_CACHE_PATH):
-        print(f"[Rank {LOCAL_RANK}] Loading cached voice prompts from {VOICE_CACHE_PATH}...")
-        with open(VOICE_CACHE_PATH, "rb") as f:
-            VOICE_PROMPT_TOKENS = pickle.load(f)
-        print(f"[Rank {LOCAL_RANK}] Loaded {len(VOICE_PROMPT_TOKENS)} cached voice prompts")
-        return
-
-    # Cache doesn't exist - only rank 0 creates it
-    if not IS_MAIN_PROCESS:
-        print(f"[Rank {LOCAL_RANK}] Waiting for rank 0 to create voice cache...")
-        # Wait for rank 0 to create the cache
-        if IS_DISTRIBUTED:
-            dist.barrier()
-        # Now load the cache that rank 0 created
-        with open(VOICE_CACHE_PATH, "rb") as f:
-            VOICE_PROMPT_TOKENS = pickle.load(f)
-        print(f"[Rank {LOCAL_RANK}] Loaded {len(VOICE_PROMPT_TOKENS)} cached voice prompts")
-        return
-
-    # Rank 0: create the cache
-    print("[Rank 0] Loading voice prompts dataset...")
-    voice_prompts_ds = load_dataset("mrfakename/voice_design", split="train")
-    voice_prompts_ds = voice_prompts_ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
-
-    print("[Rank 0] Pre-encoding voice prompts (will be cached for next run)...")
-    VOICE_PROMPT_TOKENS = []
-
-    # Process one at a time to avoid batching issues
-    for idx in tqdm(range(len(voice_prompts_ds)), desc="Encoding voice prompts"):
-        try:
-            audio_data = voice_prompts_ds[idx]["audio"]
-            if not audio_data or "array" not in audio_data:
-                continue
-
-            wav = torch.from_numpy(audio_data["array"]).to(dtype=torch.float32)
-            sr = audio_data["sampling_rate"]
-
-            # Resample if needed
-            if sr != SAMPLE_RATE:
-                resampler = T.Resample(orig_freq=sr, new_freq=SAMPLE_RATE)
-                wav = resampler(wav)
-
-            # Trim to max length
-            if wav.shape[0] > MAX_REF_SAMPLES:
-                wav = wav[:MAX_REF_SAMPLES]
-
-            # SNAC expects [batch, channels, time]
-            wav = wav.unsqueeze(0).unsqueeze(0).to(DEVICE)
-
-            with torch.inference_mode():
-                codes = snac_model.encode(wav)
-
-            # codes is a list of 3 tensors, access like codes[layer][batch][time]
-            num_frames = codes[0].shape[1]
-            all_codes = []
-
-            for i in range(num_frames):
-                all_codes.extend([
-                    codes[0][0][i].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[0],
-                    codes[1][0][2*i].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[1],
-                    codes[2][0][4*i].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[2],
-                    codes[2][0][4*i+1].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[3],
-                    codes[1][0][2*i+1].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[4],
-                    codes[2][0][4*i+2].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[5],
-                    codes[2][0][4*i+3].item() + TOKEN_OFFSET_BASE + LAYER_OFFSETS[6]
-                ])
-
-            if len(all_codes) > MAX_REF_TOKENS:
-                all_codes = all_codes[:MAX_REF_TOKENS]
-
-            if all_codes:
-                VOICE_PROMPT_TOKENS.append(all_codes)
-
-        except Exception as e:
-            if idx < 5:  # Print first few errors for debugging
-                print(f"[Rank {LOCAL_RANK}] Error encoding voice prompt {idx}: {e}")
-
-    # Save to cache
-    print(f"[Rank 0] Saving {len(VOICE_PROMPT_TOKENS)} voice prompts to cache...")
-    with open(VOICE_CACHE_PATH, "wb") as f:
-        pickle.dump(VOICE_PROMPT_TOKENS, f)
-
-    # Signal other ranks that cache is ready
-    if IS_DISTRIBUTED:
-        dist.barrier()
-
-# Load the cache (defer to main block to handle distributed init)
+# Load voice prompts cache (must be generated first with generate_voice_cache.py)
 VOICE_PROMPT_TOKENS = []
-
-def ensure_voice_prompts_loaded():
-    """Ensure voice prompts are loaded, called after distributed init."""
-    if len(VOICE_PROMPT_TOKENS) == 0:
-        load_or_create_voice_cache()
-
-# Try loading immediately if cache exists (non-distributed or cache already exists)
 if os.path.exists(VOICE_CACHE_PATH):
     with open(VOICE_CACHE_PATH, "rb") as f:
         VOICE_PROMPT_TOKENS = pickle.load(f)
-    print(f"[Rank {LOCAL_RANK}] Pre-loaded {len(VOICE_PROMPT_TOKENS)} cached voice prompts")
+    print(f"[Rank {LOCAL_RANK}] Loaded {len(VOICE_PROMPT_TOKENS)} cached voice prompts")
 else:
-    print(f"[Rank {LOCAL_RANK}] Voice cache not found, will be created/loaded during training")
+    raise RuntimeError(
+        f"Voice cache not found at {VOICE_CACHE_PATH}. "
+        "Run `python generate_voice_cache.py` first to generate it."
+    )
 
 def process_example(example):
     """
     Create prompt matching sft.py format:
     <START_OF_HUMAN><start_of_caption>{caption}<end_of_caption>{text}<END_OF_TEXT><END_OF_HUMAN><START_OF_AI><START_OF_SPEECH>{ref_audio_tokens}
     """
-    # Ensure voice prompts are loaded
-    if len(VOICE_PROMPT_TOKENS) == 0:
-        raise ValueError("Voice prompts not loaded! Ensure cache exists or run on rank 0 first.")
-
     # Pick a random voice prompt for voice cloning (50% of the time)
     if random.random() < 0.5:
         ref_tokens = random.choice(VOICE_PROMPT_TOKENS)
@@ -463,6 +352,10 @@ def process_example(example):
 
     caption = example.get("caption", "")
     text = example.get("text", "")
+
+    # 25% of the time, replace caption with a random voice emotion description
+    if VOICE_EMOTION_DESCRIPTIONS and random.random() < 0.25:
+        caption = random.choice(VOICE_EMOTION_DESCRIPTIONS)
 
     # Tokenize the text part: <start_of_caption>{caption}<end_of_caption>{text}
     text_content = f"<start_of_caption>{caption}<end_of_caption>{text}"
@@ -478,7 +371,7 @@ def process_example(example):
     )
 
     return {
-        "prompt": prompt_ids,  # Token IDs directly
+        "prompt": {"prompt_token_ids": prompt_ids},  # vLLM format for token IDs
         "expected_text": text,  # For WER comparison
         "caption": caption,  # For CLAP comparison
     }
@@ -508,25 +401,22 @@ GLOBAL_EXPECTED_TEXT = []
 # REWARD FUNCTIONS
 # =============================================================================
 @torch.inference_mode()
-def get_clap_text_embedding(text):
-    inputs = clap_tokenizer(text, max_length=512, padding=True, truncation=True, return_tensors="pt").to(DEVICE)
-    outputs = clap_text_model(**inputs)
+def get_gte_embedding(text):
+    """Get GTE text embedding for similarity computation."""
+    inputs = gte_tokenizer(text, max_length=512, padding=True, truncation=True, return_tensors="pt").to(DEVICE)
+    outputs = gte_model(**inputs)
     mask = inputs.attention_mask.unsqueeze(-1).expand(outputs.last_hidden_state.size()).float()
     sum_emb = torch.sum(outputs.last_hidden_state * mask, 1)
     sum_mask = torch.clamp(mask.sum(1), min=1e-9)
     return F.normalize(sum_emb / sum_mask, p=2, dim=1)
 
-@torch.inference_mode()
-def get_clap_audio_embedding(waveform_16k):
-    target_len = 16000 * 30
-    if waveform_16k.shape[0] > target_len:
-        waveform_16k = waveform_16k[:target_len]
-    elif waveform_16k.shape[0] < target_len:
-        waveform_16k = F.pad(waveform_16k, (0, target_len - waveform_16k.shape[0]))
-
-    inputs = clap_feature_extractor(waveform_16k.cpu().numpy(), sampling_rate=16000, return_tensors="pt")
-    emb = clap_audio_model(inputs.input_features.to(DEVICE))
-    return emb
+def tags_to_string(tags):
+    """Convert majestrino tags to a descriptive string."""
+    if not tags:
+        return ""
+    # Sort by probability and concatenate labels
+    sorted_tags = sorted(tags, key=lambda x: x['prob'], reverse=True)
+    return ", ".join(t['label'] for t in sorted_tags)
 
 INVALID_TOKEN_PENALTY = 0.1
 
@@ -534,34 +424,39 @@ def wer_reward(prompts, completions, expected_text, **kwargs):
     GLOBAL_AUDIO.clear()
     GLOBAL_EXPECTED_TEXT.clear()
 
-    # expected_text is passed directly from the dataset
-    GLOBAL_EXPECTED_TEXT.append(expected_text[0] if isinstance(expected_text, list) else expected_text)
+    # expected_text is a list (one per completion)
+    if not isinstance(expected_text, list):
+        expected_text = [expected_text] * len(completions)
 
     # Debug: log first completion to see what model generates
     if LOCAL_RANK == 0 and len(completions) > 0:
-        first_content = completions[0][0]["content"]
+        first_content = completions[0]
         print(f"[DEBUG] First completion ({len(first_content)} chars): {first_content[:200]}...")
 
     pattern = r"<custom_token_\d+>"
     scores = []
 
     for idx, completion in enumerate(completions):
-        content = completion[0]["content"]
+        # Get expected text for this completion
+        exp_text = expected_text[idx] if idx < len(expected_text) else expected_text[0]
+        GLOBAL_EXPECTED_TEXT.append(exp_text)
+
+        content = completion  # TRL passes completions as strings directly
         tokens = re.findall(pattern, content)
         codes = tokenizer.encode("".join(tokens))[1:] if tokens else []
 
         # Debug: log token extraction
         if LOCAL_RANK == 0 and idx == 0:
             print(f"[DEBUG] Found {len(tokens)} custom_tokens, {len(codes)} codes")
-        
+
         if not codes:
             scores.append(-5.0)
             GLOBAL_AUDIO.append(None)
             continue
-        
+
         num_invalid = count_invalid_tokens(codes)
         invalid_penalty = num_invalid * INVALID_TOKEN_PENALTY
-        
+
         try:
             audio = decode_tokens_to_audio(codes)
             if audio is None:
@@ -574,56 +469,90 @@ def wer_reward(prompts, completions, expected_text, **kwargs):
 
             audio_np = audio.squeeze().cpu().numpy()
             result = asr_pipe(audio_np, return_timestamps=True)
-            transcribed = result["text"]
-            
-            wer_score = compute_wer(expected_text.lower(), transcribed.lower())
-            accuracy = max(0, 1 - wer_score)
+            transcribed = result["text"].strip()
+
+            # Compute both WER and CER for better accuracy signal
+            ref_lower = exp_text.lower().strip()
+            hyp_lower = transcribed.lower().strip()
+
+            # Debug: log transcription for first completion
+            if LOCAL_RANK == 0 and idx == 0:
+                print(f"[DEBUG] Expected: {ref_lower[:100]}...")
+                print(f"[DEBUG] Transcribed: {hyp_lower[:100]}...")
+
+            if not hyp_lower:
+                # Empty transcription
+                scores.append(-3.0 - invalid_penalty)
+                continue
+
+            wer_score = compute_wer(ref_lower, hyp_lower)
+            cer_score = compute_cer(ref_lower, hyp_lower)
+
+            # Combine WER (70%) and CER (30%) - CER rewards partial word matches
+            combined_error = 0.7 * wer_score + 0.3 * cer_score
+            accuracy = max(0, 1 - combined_error)
             final_score = accuracy - invalid_penalty
             scores.append(final_score)
-            
+
         except Exception as e:
             print(f"[Rank {LOCAL_RANK}] WER error: {e}")
             scores.append(-5.0 - invalid_penalty)
             GLOBAL_AUDIO.append(None)
-    
+
     return scores
 
-def whisperclap_reward(prompts, completions, caption, **kwargs):
-    # caption is passed directly from the dataset
-    caption_text = caption[0] if isinstance(caption, list) else caption
+def majestrino_reward(prompts, completions, caption, **kwargs):
+    """Compute caption similarity using MajestrinoTagger + GTE embeddings."""
+    # caption is a list (one per completion)
+    if not isinstance(caption, list):
+        caption = [caption] * len(completions)
 
-    if not caption_text:
-        return [0.0] * len(completions)
-
-    text_emb = get_clap_text_embedding(caption_text)
-    
     scores = []
-    for audio in GLOBAL_AUDIO:
-        if audio is None:
+    for idx in range(len(completions)):
+        cap_text = caption[idx] if idx < len(caption) else caption[0]
+        audio = GLOBAL_AUDIO[idx] if idx < len(GLOBAL_AUDIO) else None
+
+        if not cap_text or audio is None:
             scores.append(-1.0)
             continue
 
         try:
-            # Move audio from CPU to the correct device for this rank
-            audio_24k = audio.squeeze().to(DEVICE)
-            audio_16k = RESAMPLER_24_TO_16(audio_24k)
-            audio_emb = get_clap_audio_embedding(audio_16k)
-            similarity = torch.matmul(audio_emb, text_emb.t()).item()
+            # Save audio to temp file for majestrino
+            audio_np = audio.squeeze().cpu().numpy()
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                sf.write(f.name, audio_np, SAMPLE_RATE)
+                temp_path = f.name
+
+            # Tag audio with majestrino (threshold=95% for high confidence tags)
+            tags = majestrino_tagger.tag(temp_path, threshold=95.0, top_n_per_category=5)
+            os.unlink(temp_path)  # Clean up temp file
+
+            if not tags:
+                scores.append(-0.5)  # No tags detected
+                continue
+
+            # Convert tags to string and compute GTE similarity
+            tags_str = tags_to_string(tags)
+            tags_emb = get_gte_embedding(tags_str)
+            caption_emb = get_gte_embedding(cap_text)
+            similarity = torch.matmul(tags_emb, caption_emb.t()).item()
             scores.append(similarity)
+
         except Exception as e:
-            print(f"[Rank {LOCAL_RANK}] CLAP error: {e}")
+            print(f"[Rank {LOCAL_RANK}] Majestrino error: {e}")
             scores.append(-1.0)
 
     return scores
 
 def audiobox_reward(prompts, completions, **kwargs):
-    scores = []
+    num_completions = len(completions)
+    scores = [-1.0] * num_completions  # Pre-fill with default scores
 
-    valid_audios = [(i, audio) for i, audio in enumerate(GLOBAL_AUDIO) if audio is not None]
+    valid_audios = [(i, audio) for i, audio in enumerate(GLOBAL_AUDIO) if audio is not None and i < num_completions]
 
     if not valid_audios:
         GLOBAL_AUDIO.clear()
-        return [-1.0] * len(completions)
+        return scores
 
     try:
         # Audiobox predictor always uses cuda:0 - move audio there explicitly
@@ -631,21 +560,16 @@ def audiobox_reward(prompts, completions, **kwargs):
             {"path": audio.squeeze().unsqueeze(0).to("cuda:0"), "sample_rate": 24000}
             for _, audio in valid_audios
         ])
-        
-        pred_dict = {valid_audios[i][0]: pred for i, pred in enumerate(predictions)}
-        
-        for i in range(len(completions)):
-            if i in pred_dict:
-                pq = pred_dict[i]["PQ"]
-                score = (pq - 5) / 5
-                scores.append(score)
-            else:
-                scores.append(-1.0)
-                
+
+        for i, pred in enumerate(predictions):
+            idx = valid_audios[i][0]
+            if idx < num_completions:
+                pq = pred["PQ"]
+                scores[idx] = (pq - 5) / 5
+
     except Exception as e:
         print(f"[Rank {LOCAL_RANK}] Audiobox error: {e}")
-        scores = [-1.0] * len(completions)
-    
+
     GLOBAL_AUDIO.clear()
     return scores
 
@@ -659,17 +583,17 @@ training_args = GRPOConfig(
     lr_scheduler_type="cosine",
     optim="adamw_torch",
     logging_steps=1,
-    per_device_train_batch_size=2,  # H100s can handle more
-    gradient_accumulation_steps=4,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=8,
     num_train_epochs=1,
     save_steps=100,
     report_to="wandb",
     output_dir="outputs_laion",
     bf16=True,
 
-    num_generations=4,  # More generations = better reward signal
+    num_generations=2,  # Reduced to save memory
     max_prompt_length=2048,
-    max_completion_length=2048,
+    max_completion_length=1500,
 
     # Sampling parameters (same for both vLLM and HF generate)
     temperature=0.8,
@@ -685,8 +609,8 @@ training_args = GRPOConfig(
     # vLLM for fast generation (3-5x speedup)
     use_vllm=True,
     vllm_mode="colocate",  # Share GPU with training (vs "server" mode)
-    vllm_gpu_memory_utilization=0.4,  # Low since reward models take ~30GB
-    vllm_max_model_length=3000,  # Reduced from 4096 to fit in KV cache
+    vllm_gpu_memory_utilization=0.3,  # Reduced for OOM
+    vllm_max_model_length=2500,  # Reduced for OOM
     vllm_tensor_parallel_size=1,  # Each GPU runs its own vLLM instance
     vllm_enable_sleep_mode=True,  # Offload vLLM weights during backward pass
 
@@ -713,7 +637,7 @@ training_args = GRPOConfig(
 trainer = GRPOTrainer(
     model=model,
     processing_class=tokenizer,
-    reward_funcs=[wer_reward, whisperclap_reward, audiobox_reward],
+    reward_funcs=[wer_reward, majestrino_reward, audiobox_reward],
     args=training_args,
     train_dataset=dataset,
 )
