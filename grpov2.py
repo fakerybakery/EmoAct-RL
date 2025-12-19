@@ -357,7 +357,11 @@ if __name__ == "__main__":
         temperature=0.8,
         bf16=True,                
         use_vllm=True,
+        vllm_mode="colocate",
         vllm_gpu_memory_utilization=0.3,
+        vllm_max_model_length=2048,
+        vllm_tensor_parallel_size=1,
+        vllm_enable_sleep_mode=True,
         report_to="wandb",
         remove_unused_columns=False,
         # FSDP config for multi-GPU training
