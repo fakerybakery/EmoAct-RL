@@ -332,19 +332,17 @@ if __name__ == "__main__":
     # Initialize helper models (sets global variables)
     init_helper_models()
     
-    # 1. Load Tokenizer & Patch
+    # 1. Load Tokenizer (special tokens already exist in Vocalino vocab)
     tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH)
-    patch_tokenizer(tokenizer)
-    
+
     # Fix padding
     if tokenizer.eos_token_id is None: tokenizer.eos_token_id = 128009
     if tokenizer.pad_token_id is None: tokenizer.pad_token_id = 128009
     tokenizer.padding_side = "left"
     tokenizer.model_input_names = ["input_ids", "attention_mask"]
 
-    # 2. Load Model & Resize Embeddings for new tokens
+    # 2. Load Model (do NOT resize embeddings - vLLM expects original vocab size)
     model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_PATH, torch_dtype=torch.bfloat16, use_cache=False)
-    model.resize_token_embeddings(len(tokenizer)) # Necessary because we added tokens
 
     training_args = GRPOConfig(
         output_dir="vocalino_0.11_grpo_new",
