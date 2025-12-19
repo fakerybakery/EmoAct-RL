@@ -165,6 +165,13 @@ def combined_reward(prompts, completions, expected_text, caption, **kwargs):
         if isinstance(completion, list): content = completion[0]["content"]
         else: content = str(completion)
 
+        # Debug: log what the model is generating
+        if LOCAL_RANK == 0 and i == 0:
+            log_debug(f"Completion length: {len(content)} chars")
+            log_debug(f"Completion preview: {content[:200]}...")
+            token_strings = re.findall(r"<custom_token_(\d+)>", content)
+            log_debug(f"Found {len(token_strings)} audio tokens")
+
         audio_np = decode_vocalino_audio(content, snac_model)
         
         if audio_np is None:
