@@ -113,6 +113,8 @@ if tokenizer.eos_token_id is None:
 if tokenizer.pad_token_id is None:
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
+# Keep the model's original chat template (used by inference.py)
+
 # Disable token_type_ids (not used by this model) - force override
 tokenizer.model_input_names = ['input_ids', 'attention_mask']
 
@@ -352,12 +354,6 @@ def process_example(example):
     Create prompt matching sft.py format:
     <START_OF_HUMAN><start_of_caption>{caption}<end_of_caption>{text}<END_OF_TEXT><END_OF_HUMAN><START_OF_AI><START_OF_SPEECH>{ref_audio_tokens}
     """
-    # Pick a random voice prompt for voice cloning (50% of the time)
-    if random.random() < 0.5:
-        ref_tokens = random.choice(VOICE_PROMPT_TOKENS)
-    else:
-        ref_tokens = []  # No voice prompt - model learns to generate without cloning
-
     caption = example.get("caption", "")
     text = example.get("text", "")
 
@@ -365,23 +361,29 @@ def process_example(example):
     if VOICE_EMOTION_DESCRIPTIONS and random.random() < 0.25:
         caption = random.choice(VOICE_EMOTION_DESCRIPTIONS)
 
-    # Tokenize the text part: <start_of_caption>{caption}<end_of_caption>{text}
-    text_content = f"<start_of_caption>{caption}<end_of_caption>{text}"
-    text_ids = tokenizer.encode(text_content, add_special_tokens=False)
+    # Build prompt matching inference.py format exactly:
+    voice = "tara"
+    if caption:
+        user_content = f"{voice}: <start_of_caption>{caption}<end_of_caption>{text}"
+    else:
+        user_content = f"{voice}: {text}"
 
-    # Build full prompt token sequence (model continues from here)
-    prompt_ids = (
-        [START_OF_HUMAN]
-        + text_ids
-        + [END_OF_TEXT, END_OF_HUMAN]
-        + [START_OF_AI, START_OF_SPEECH]
-        + ref_tokens  # Reference audio for voice cloning
+    messages = [{"role": "user", "content": user_content}]
+
+    # Use apply_chat_template like inference.py does
+    prompt_ids = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        return_tensors=None,  # Return list of ints
     )
 
+    # Convert to text for TRL
+    prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=False)
+
     return {
-        "prompt": {"prompt_token_ids": prompt_ids},  # vLLM format for token IDs
+        "prompt": prompt_text,  # Text format for proper logprob computation
         "expected_text": text,  # For WER comparison
-        "caption": caption,  # For CLAP comparison
+        "caption": caption,  # For caption comparison
     }
 
 print("Processing dataset...")
@@ -451,7 +453,11 @@ def wer_reward(prompts, completions, expected_text, **kwargs):
 
         content = completion  # TRL passes completions as strings directly
         tokens = re.findall(pattern, content)
-        codes = tokenizer.encode("".join(tokens))[1:] if tokens else []
+        # Join tokens and remove control token sequences (matching notebook)
+        tokens_str = "".join(tokens)
+        tokens_str = tokens_str.replace("<custom_token_4><custom_token_5><custom_token_1>", "")  # END_OF_HUMAN+START_OF_AI+START_OF_SPEECH
+        tokens_str = tokens_str.replace("<custom_token_2><custom_token_6>", "")  # END_OF_SPEECH+END_OF_AI
+        codes = tokenizer.encode(tokens_str)[1:] if tokens_str else []
 
         # Debug: log token extraction
         if LOCAL_RANK == 0 and idx == 0:
@@ -475,8 +481,14 @@ def wer_reward(prompts, completions, expected_text, **kwargs):
             # Store on CPU to avoid cross-device issues in subsequent reward functions
             GLOBAL_AUDIO.append(audio.cpu())
 
-            audio_np = audio.squeeze().cpu().numpy()
-            result = asr_pipe(audio_np, return_timestamps=True)
+            # Resample 24kHz -> 16kHz for Whisper ASR
+            audio_24k = audio.squeeze().cpu()
+            resampler = T.Resample(orig_freq=24000, new_freq=16000)
+            audio_16k = resampler(audio_24k)
+            audio_np = audio_16k.numpy()
+
+            # Pass audio with explicit sample rate to Whisper
+            result = asr_pipe({"raw": audio_np, "sampling_rate": 16000}, return_timestamps=True)
             transcribed = result["text"].strip()
 
             # Compute both WER and CER for better accuracy signal
