@@ -356,7 +356,7 @@ if __name__ == "__main__":
         max_completion_length=2048,
         temperature=0.8,
         bf16=True,                
-        use_vllm=True,
+        use_vllm=False,
         vllm_gpu_memory_utilization=0.7,
         report_to="wandb",
         remove_unused_columns=False,
