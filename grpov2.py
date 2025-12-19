@@ -357,7 +357,6 @@ if __name__ == "__main__":
         temperature=0.8,
         bf16=True,                
         use_vllm=True,
-        vllm_device=f"cuda:{LOCAL_RANK}",
         vllm_gpu_memory_utilization=0.7,
         report_to="wandb",
         remove_unused_columns=False,
