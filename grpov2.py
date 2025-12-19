@@ -357,7 +357,7 @@ if __name__ == "__main__":
         temperature=0.8,
         bf16=True,                
         use_vllm=True,
-        vllm_gpu_memory_utilization=0.7,
+        vllm_gpu_memory_utilization=0.3,
         report_to="wandb",
         remove_unused_columns=False,
         # FSDP config for multi-GPU training
