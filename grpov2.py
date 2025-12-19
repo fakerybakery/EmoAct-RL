@@ -276,21 +276,31 @@ def patch_tokenizer(tokenizer):
     # The key is consistent usage.
     return tokenizer
 
-def format_vocalino_prompt(example):
+def format_vocalino_prompt(example, tokenizer):
     caption = example['caption']
     text = example['text']
-    
-    # Construct prompt using the EXPLICIT STRINGS we registered
-    # This guarantees the tokenizer won't split them into garbage text
-    prompt_str = (
-        f"{TOK_START_HUMAN}"
-        f"<start_of_caption>{caption}<end_of_caption>{text}"
-        f"{TOK_END_HUMAN}"
-        f"{TOK_START_AI}{TOK_START_SPEECH}" # <--- The Trigger
+
+    # Match train_laion.py format exactly - use apply_chat_template
+    voice = "tara"
+    if caption:
+        user_content = f"{voice}: <start_of_caption>{caption}<end_of_caption>{text}"
+    else:
+        user_content = f"{voice}: {text}"
+
+    messages = [{"role": "user", "content": user_content}]
+
+    # Use apply_chat_template like train_laion.py does
+    prompt_ids = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        return_tensors=None,
     )
-    
+
+    # Convert to text for TRL
+    prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=False)
+
     return {
-        "prompt": prompt_str,
+        "prompt": prompt_text,
         "expected_text": text,
         "caption": caption,
     }
@@ -356,7 +366,7 @@ if __name__ == "__main__":
         bf16=True,                
         use_vllm=True,
         vllm_mode="colocate",
-        vllm_gpu_memory_utilization=0.3,
+        vllm_gpu_memory_utilization=0.2,
         vllm_max_model_length=2048,
         vllm_tensor_parallel_size=1,
         vllm_enable_sleep_mode=True,
@@ -374,7 +384,7 @@ if __name__ == "__main__":
     )
 
     dataset = load_dataset(DATASET_NAME, split="train")
-    dataset = dataset.map(format_vocalino_prompt)
+    dataset = dataset.map(lambda x: format_vocalino_prompt(x, tokenizer))
 
     trainer = GRPOTrainer(
         model=model,
