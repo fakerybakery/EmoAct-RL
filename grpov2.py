@@ -88,7 +88,16 @@ def prepare_local_model():
         os.makedirs(LOCAL_MODEL_PATH, exist_ok=True)
         model_tmp = AutoModelForCausalLM.from_pretrained(BASE_MODEL_NAME, torch_dtype=torch.bfloat16)
         tokenizer_tmp = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
-        tokenizer_tmp.chat_template = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+        # Chat template must include the generation prompt for audio mode
+        # Format: <|startofhuman|>{content}<|endofhuman|><|startofai|><|startofspeech|>
+        tokenizer_tmp.chat_template = (
+            "{% for message in messages %}"
+            "{% if message['role'] == 'user' %}"
+            "<|startofhuman|>{{ message['content'] }}<|endofhuman|>"
+            "{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}<|startofai|><|startofspeech|>{% endif %}"
+        )
         model_tmp.save_pretrained(LOCAL_MODEL_PATH)
         tokenizer_tmp.save_pretrained(LOCAL_MODEL_PATH)
         with open(marker_file, "w") as f: f.write("ready")
@@ -305,6 +314,12 @@ def format_vocalino_prompt(example, tokenizer):
 
     # Convert to text for TRL
     prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=False)
+
+    # Debug: log first prompt to see format
+    if not hasattr(format_vocalino_prompt, '_logged'):
+        print(f"[DEBUG] Prompt format: {prompt_text[:200]}...")
+        print(f"[DEBUG] Prompt IDs (last 10): {prompt_ids[-10:]}")
+        format_vocalino_prompt._logged = True
 
     return {
         "prompt": prompt_text,
