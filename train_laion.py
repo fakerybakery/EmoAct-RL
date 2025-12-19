@@ -148,20 +148,28 @@ asr_pipe = pipeline(
     torch_dtype=torch.bfloat16,
 )
 
-# Majestrino Tagger for audio tagging
-print(f"[Rank {LOCAL_RANK}] Loading MajestrinoTagger...")
-majestrino_tagger = MajestrinoTagger.from_pretrained()
-majestrino_tagger.load_tags()
-print(f"[Rank {LOCAL_RANK}] MajestrinoTagger loaded")
+# Majestrino Tagger and Audiobox only on rank 0 (they use cuda:0)
+majestrino_tagger = None
+audiobox_predictor = None
+gte_tokenizer = None
+gte_model = None
 
-# GTE text encoder for computing similarity between tags and caption
-print(f"[Rank {LOCAL_RANK}] Loading GTE text encoder...")
-gte_tokenizer = AutoTokenizer.from_pretrained("Alibaba-NLP/gte-base-en-v1.5")
-gte_model = AutoModel.from_pretrained("Alibaba-NLP/gte-base-en-v1.5", trust_remote_code=True).to(DEVICE).eval()
-print(f"[Rank {LOCAL_RANK}] GTE loaded")
+if LOCAL_RANK == 0:
+    print(f"[Rank 0] Loading MajestrinoTagger...")
+    majestrino_tagger = MajestrinoTagger.from_pretrained()
+    majestrino_tagger.load_tags()
+    print(f"[Rank 0] MajestrinoTagger loaded")
 
-# Audiobox Aesthetics - always runs on cuda:0 (hardcoded in library)
-audiobox_predictor = initialize_predictor()
+    # GTE text encoder for computing similarity between tags and caption
+    print(f"[Rank 0] Loading GTE text encoder...")
+    gte_tokenizer = AutoTokenizer.from_pretrained("Alibaba-NLP/gte-base-en-v1.5")
+    gte_model = AutoModel.from_pretrained("Alibaba-NLP/gte-base-en-v1.5", trust_remote_code=True).to(DEVICE).eval()
+    print(f"[Rank 0] GTE loaded")
+
+    # Audiobox Aesthetics - always runs on cuda:0 (hardcoded in library)
+    print(f"[Rank 0] Loading Audiobox...")
+    audiobox_predictor = initialize_predictor()
+    print(f"[Rank 0] Audiobox loaded")
 
 # =============================================================================
 # AUDIO ENCODING (for voice cloning reference)
@@ -503,6 +511,10 @@ def wer_reward(prompts, completions, expected_text, **kwargs):
 
 def majestrino_reward(prompts, completions, caption, **kwargs):
     """Compute caption similarity using MajestrinoTagger + GTE embeddings."""
+    # MajestrinoTagger only works on cuda:0, so only rank 0 computes this
+    if LOCAL_RANK != 0:
+        return [0.0] * len(completions)
+
     # caption is a list (one per completion)
     if not isinstance(caption, list):
         caption = [caption] * len(completions)
@@ -546,7 +558,12 @@ def majestrino_reward(prompts, completions, caption, **kwargs):
 
 def audiobox_reward(prompts, completions, **kwargs):
     num_completions = len(completions)
-    scores = [-1.0] * num_completions  # Pre-fill with default scores
+    scores = [0.0] * num_completions  # Pre-fill with neutral scores
+
+    # Audiobox only works on cuda:0, so only rank 0 computes this
+    if LOCAL_RANK != 0:
+        GLOBAL_AUDIO.clear()
+        return scores
 
     valid_audios = [(i, audio) for i, audio in enumerate(GLOBAL_AUDIO) if audio is not None and i < num_completions]
 
