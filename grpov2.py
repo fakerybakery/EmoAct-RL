@@ -40,14 +40,14 @@ DEVICE = f"cuda:{LOCAL_RANK}"
 SNAC_DEVICE = "cpu"
 
 # =============================================================================
-# VOCALINO TOKENS
+# VOCALINO TOKENS - THESE ARE THE CORRECT IDS THE MODEL WAS TRAINED WITH
 # =============================================================================
 TOKEN_OFFSET_BASE = 128266
 SNAC_VOCAB_SIZE = 4096
 LAYER_OFFSETS = [0, 4096, 8192, 12288, 16384, 20480, 24576]
 AUDIO_TOKEN_END = 7 * SNAC_VOCAB_SIZE  # 28672
 
-# Special token IDs
+# Special token IDs - model was trained with these exact IDs
 START_OF_SPEECH = 128257
 END_OF_SPEECH = 128258
 START_OF_HUMAN = 128259
@@ -63,30 +63,18 @@ def log_debug(msg):
         print(f"[DEBUG] {msg}", flush=True)
 
 # =============================================================================
-# MODEL PREPARATION
+# MODEL PREPARATION - Just save without modifying chat template
 # =============================================================================
 def prepare_local_model():
-    """Save model with proper chat template that triggers audio generation."""
-    marker_file = os.path.join(LOCAL_MODEL_PATH, ".ready_v2")
+    marker_file = os.path.join(LOCAL_MODEL_PATH, ".ready_v3")
     if os.path.exists(marker_file):
         return
     if LOCAL_RANK == 0:
-        log_debug("Preparing local model with audio chat template...")
+        log_debug("Preparing local model (preserving original tokenizer)...")
         os.makedirs(LOCAL_MODEL_PATH, exist_ok=True)
         model_tmp = AutoModelForCausalLM.from_pretrained(BASE_MODEL_NAME, torch_dtype=torch.bfloat16)
         tokenizer_tmp = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
-
-        # Chat template that outputs the correct special token IDs for audio generation
-        # The model expects: <|startofhuman|>content<|endofhuman|><|startofai|><|startofspeech|>
-        tokenizer_tmp.chat_template = (
-            "{% for message in messages %}"
-            "{% if message['role'] == 'user' %}"
-            "<|startofhuman|>{{ message['content'] }}<|endofhuman|>"
-            "{% endif %}"
-            "{% endfor %}"
-            "{% if add_generation_prompt %}<|startofai|><|startofspeech|>{% endif %}"
-        )
-
+        # DON'T modify the tokenizer - keep original vocab and mappings
         model_tmp.save_pretrained(LOCAL_MODEL_PATH)
         tokenizer_tmp.save_pretrained(LOCAL_MODEL_PATH)
         with open(marker_file, "w") as f:
@@ -97,6 +85,47 @@ def prepare_local_model():
             time.sleep(1)
 
 prepare_local_model()
+
+# =============================================================================
+# TOKENIZER DIAGNOSTICS
+# =============================================================================
+def diagnose_tokenizer(tokenizer):
+    """Check if the tokenizer can properly handle the special tokens."""
+    log_debug("=" * 60)
+    log_debug("TOKENIZER DIAGNOSTICS")
+    log_debug("=" * 60)
+
+    log_debug(f"Vocab size: {tokenizer.vocab_size}")
+    log_debug(f"Len(tokenizer): {len(tokenizer)}")
+
+    # Check what the special token IDs decode to
+    special_ids = {
+        "START_OF_SPEECH": START_OF_SPEECH,
+        "END_OF_SPEECH": END_OF_SPEECH,
+        "START_OF_HUMAN": START_OF_HUMAN,
+        "END_OF_HUMAN": END_OF_HUMAN,
+        "START_OF_AI": START_OF_AI,
+    }
+
+    for name, token_id in special_ids.items():
+        try:
+            decoded = tokenizer.decode([token_id])
+            re_encoded = tokenizer.encode(decoded, add_special_tokens=False)
+            log_debug(f"{name} (ID {token_id}): decodes to '{decoded}' -> re-encodes to {re_encoded}")
+        except Exception as e:
+            log_debug(f"{name} (ID {token_id}): ERROR - {e}")
+
+    # Check audio token range
+    sample_audio_ids = [128266, 128270, 130000, 140000, 150000]
+    log_debug("Audio token samples:")
+    for token_id in sample_audio_ids:
+        try:
+            decoded = tokenizer.decode([token_id])
+            log_debug(f"  ID {token_id} -> '{decoded}'")
+        except Exception as e:
+            log_debug(f"  ID {token_id} -> ERROR: {e}")
+
+    log_debug("=" * 60)
 
 # =============================================================================
 # AUDIO DECODING
@@ -257,27 +286,46 @@ def clap_reward(prompts, completions, caption, **kwargs):
     return scores
 
 # =============================================================================
-# PROMPT FORMATTING
+# PROMPT FORMATTING - Match working_inference.py EXACTLY
 # =============================================================================
 def format_vocalino_prompt(example, tokenizer):
+    """Build prompt matching working_inference.py format exactly.
+
+    Working format:
+    [START_OF_HUMAN] + encode("Text: {caption}. {text}") + [128009, END_OF_HUMAN, START_OF_AI, START_OF_SPEECH]
+    """
     caption = example['caption']
     text = example['text']
 
-    voice = "tara"
+    # Match working_inference.py: "{caption}. {text}" or just "{text}"
     if caption:
-        user_content = f"{voice}: <start_of_caption>{caption}<end_of_caption>{text}"
+        prompt_content = f"{caption}. {text}"
     else:
-        user_content = f"{voice}: {text}"
+        prompt_content = text
 
-    messages = [{"role": "user", "content": user_content}]
+    # Encode with "Text: " prefix like working_inference.py line 184
+    content_ids = tokenizer.encode("Text: " + prompt_content, add_special_tokens=False)
 
-    prompt_ids = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        return_tensors=None,
-    )
+    # Build prompt with EXACT sequence from working_inference.py line 185:
+    # [START_OF_HUMAN] + content + [128009, END_OF_HUMAN, START_OF_AI, START_OF_SPEECH]
+    # Note: 128009 = END_OF_TEXT = <|eot_id|> - THIS WAS MISSING!
+    prompt_ids = [START_OF_HUMAN] + content_ids + [END_OF_TEXT, END_OF_HUMAN, START_OF_AI, START_OF_SPEECH]
 
+    # Decode to text for TRL
     prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=False)
+
+    # Verify round-trip (only on first call)
+    if not hasattr(format_vocalino_prompt, '_checked'):
+        format_vocalino_prompt._checked = True
+        re_encoded = tokenizer.encode(prompt_text, add_special_tokens=False)
+        if prompt_ids != re_encoded:
+            log_debug(f"[WARNING] Round-trip mismatch!")
+            log_debug(f"  Original IDs (last 10): {prompt_ids[-10:]}")
+            log_debug(f"  Re-encoded (last 10): {re_encoded[-10:]}")
+            log_debug(f"  Prompt text (last 100 chars): ...{prompt_text[-100:]}")
+        else:
+            log_debug(f"[OK] Round-trip successful! Last 5 IDs: {prompt_ids[-5:]}")
+            log_debug(f"  Format: [START_OF_HUMAN] + 'Text: ...' + [EOT, END_OF_HUMAN, START_OF_AI, START_OF_SPEECH]")
 
     return {
         "prompt": prompt_text,
@@ -289,7 +337,7 @@ def format_vocalino_prompt(example, tokenizer):
 # MAIN
 # =============================================================================
 if __name__ == "__main__":
-    # Load tokenizer (DO NOT modify it)
+    # Load tokenizer without modification
     tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH)
 
     if tokenizer.eos_token_id is None:
@@ -299,7 +347,10 @@ if __name__ == "__main__":
     tokenizer.padding_side = "left"
     tokenizer.model_input_names = ["input_ids", "attention_mask"]
 
-    # Load model (DO NOT resize embeddings)
+    # Run diagnostics
+    diagnose_tokenizer(tokenizer)
+
+    # Load model without modification
     model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_PATH, torch_dtype=torch.bfloat16)
 
     # Load helper models
@@ -322,11 +373,10 @@ if __name__ == "__main__":
         majestrino_tagger = MajestrinoTagger.from_pretrained()
         majestrino_tagger.load_tags()
 
-    # Debug: print sample prompt
+    # Test prompt formatting
     sample = {"caption": "test caption", "text": "Hello world"}
     sample_prompt = format_vocalino_prompt(sample, tokenizer)
-    log_debug(f"Sample prompt: {sample_prompt['prompt'][:200]}...")
-    log_debug(f"Sample prompt token IDs (last 5): {tokenizer.encode(sample_prompt['prompt'])[-5:]}")
+    log_debug(f"Sample prompt: {sample_prompt['prompt']}")
 
     training_args = GRPOConfig(
         output_dir="vocalino_0.11_grpo_new",
