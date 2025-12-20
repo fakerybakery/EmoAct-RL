@@ -362,9 +362,6 @@ def init_helper_models():
 # MAIN
 # =============================================================================
 if __name__ == "__main__":
-    # Initialize helper models (sets global variables)
-    init_helper_models()
-    
     # 1. Load Tokenizer (special tokens already exist in Vocalino vocab)
     tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH)
 
@@ -382,11 +379,11 @@ if __name__ == "__main__":
         learning_rate=1e-5,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
-        num_generations=8,         
+        num_generations=8,
         max_prompt_length=1024,
         max_completion_length=2048,
         temperature=0.8,
-        bf16=True,                
+        bf16=True,
         use_vllm=True,
         vllm_mode="colocate",
         vllm_gpu_memory_utilization=0.2,
@@ -416,6 +413,9 @@ if __name__ == "__main__":
         args=training_args,
         train_dataset=dataset,
     )
+
+    # Initialize helper models AFTER trainer (vLLM) is set up
+    init_helper_models()
 
     log_debug("Starting Training...")
     trainer.train()
