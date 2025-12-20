@@ -53,13 +53,14 @@ SNAC_VOCAB_SIZE = 4096
 LAYER_OFFSETS = [0, 4096, 8192, 8192, 4096, 8192, 8192]
 AUDIO_TOKEN_END = TOKEN_OFFSET_BASE + (3 * SNAC_VOCAB_SIZE)
 
-# Explicit Strings for mapping
-TOK_START_SPEECH = "<|startofspeech|>"
-TOK_END_SPEECH = "<|endofspeech|>"
-TOK_START_AI = "<|startofai|>"
-TOK_START_HUMAN = "<|startofhuman|>"
-TOK_END_HUMAN = "<|endofhuman|>"
-TOK_END_TEXT = "<|endoftext|>"
+# Special token IDs (already in the model's vocabulary)
+START_OF_SPEECH = 128257
+END_OF_SPEECH = 128258
+START_OF_HUMAN = 128259
+END_OF_HUMAN = 128260
+START_OF_AI = 128261
+END_OF_AI = 128262
+END_OF_TEXT = 128009
 
 # =============================================================================
 # LOGGING
@@ -237,34 +238,24 @@ def clap_reward(prompts, completions, caption, **kwargs):
     return scores
 
 # =============================================================================
-# TOKENIZER PATCHING (CRITICAL FIX)
+# PROMPT FORMATTING
 # =============================================================================
-def patch_tokenizer(tokenizer):
-    """
-    Force-register special tokens with specific strings so we can construct
-    prompts that survive the ID->String->ID roundtrip.
-    """
-    special_tokens = [
-        TOK_START_SPEECH, TOK_END_SPEECH,
-        TOK_START_AI, TOK_START_HUMAN, TOK_END_HUMAN
-    ]
-    tokenizer.add_special_tokens({'additional_special_tokens': special_tokens})
-    return tokenizer
-
-def format_vocalino_prompt(example):
+def format_vocalino_prompt(example, tokenizer):
     caption = example['caption']
     text = example['text']
 
-    # Construct prompt using the EXPLICIT STRINGS we registered
-    prompt_str = (
-        f"{TOK_START_HUMAN}"
-        f"<start_of_caption>{caption}<end_of_caption>{text}"
-        f"{TOK_END_HUMAN}"
-        f"{TOK_START_AI}{TOK_START_SPEECH}"
-    )
+    # Tokenize the text content
+    content = f"<start_of_caption>{caption}<end_of_caption>{text}"
+    content_ids = tokenizer.encode(content, add_special_tokens=False)
+
+    # Build prompt with correct special token IDs
+    prompt_ids = [START_OF_HUMAN] + content_ids + [END_OF_HUMAN, START_OF_AI, START_OF_SPEECH]
+
+    # Decode back to text for TRL (it expects text prompts)
+    prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=False)
 
     return {
-        "prompt": prompt_str,
+        "prompt": prompt_text,
         "expected_text": text,
         "caption": caption,
     }
