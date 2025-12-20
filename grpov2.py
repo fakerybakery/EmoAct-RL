@@ -95,7 +95,7 @@ prepare_local_model()
 def sanitize_indices(lst):
     return [max(0, min(SNAC_VOCAB_SIZE - 1, x)) for x in lst]
 
-def decode_vocalino_audio(text_content, snac_model_ref):
+def decode_vocalino_audio(text_content, snac_model_ref, debug=False):
     token_strings = re.findall(r"<custom_token_(\d+)>", text_content)
 
     if len(token_strings) == 0:
@@ -103,11 +103,21 @@ def decode_vocalino_audio(text_content, snac_model_ref):
 
     token_ids = [int(t) for t in token_strings]
 
+    if debug and LOCAL_RANK == 0:
+        log_debug(f"Token ID range: min={min(token_ids)}, max={max(token_ids)}")
+        log_debug(f"Expected range: {TOKEN_OFFSET_BASE} to {AUDIO_TOKEN_END}")
+
     # Filter valid IDs (must be in audio token range)
     valid_ids = [t for t in token_ids if TOKEN_OFFSET_BASE <= t < AUDIO_TOKEN_END]
+
+    if debug and LOCAL_RANK == 0:
+        log_debug(f"Valid IDs after filter: {len(valid_ids)} / {len(token_ids)}")
+
     valid_ids = valid_ids[:(len(valid_ids) // 7) * 7]
 
     if len(valid_ids) < 7:
+        if debug and LOCAL_RANK == 0:
+            log_debug(f"Not enough valid IDs: {len(valid_ids)}")
         return None
 
     # De-interleave into 3 SNAC layers (matching train_laion.py)
@@ -174,7 +184,7 @@ def wer_reward(prompts, completions, expected_text, **kwargs):
             token_strings = re.findall(r"<custom_token_(\d+)>", content)
             log_debug(f"Found {len(token_strings)} audio tokens")
 
-        audio_np = decode_vocalino_audio(content, snac_model)
+        audio_np = decode_vocalino_audio(content, snac_model, debug=(i == 0))
         GLOBAL_AUDIO_CACHE.append(audio_np)
 
         if audio_np is None:
