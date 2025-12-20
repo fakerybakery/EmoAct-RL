@@ -264,19 +264,17 @@ def format_vocalino_prompt(example, tokenizer):
 # MAIN
 # =============================================================================
 if __name__ == "__main__":
-    # 1. Load Tokenizer & Patch
+    # 1. Load Tokenizer (DO NOT add new tokens - use existing ones)
     tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH)
-    patch_tokenizer(tokenizer)
 
     # Fix padding
-    if tokenizer.eos_token_id is None: tokenizer.eos_token_id = 128009
-    if tokenizer.pad_token_id is None: tokenizer.pad_token_id = 128009
+    if tokenizer.eos_token_id is None: tokenizer.eos_token_id = END_OF_TEXT
+    if tokenizer.pad_token_id is None: tokenizer.pad_token_id = END_OF_TEXT
     tokenizer.padding_side = "left"
     tokenizer.model_input_names = ["input_ids", "attention_mask"]
 
-    # 2. Load Model & Resize Embeddings for new tokens
+    # 2. Load Model (DO NOT resize embeddings - tokens already exist)
     model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_PATH, torch_dtype=torch.bfloat16)
-    model.resize_token_embeddings(len(tokenizer))
 
     # 3. Load Helper Models
     log_debug(f"Loading SNAC on {SNAC_DEVICE}...")
@@ -315,7 +313,7 @@ if __name__ == "__main__":
     )
 
     dataset = load_dataset(DATASET_NAME, split="train")
-    dataset = dataset.map(format_vocalino_prompt)
+    dataset = dataset.map(lambda x: format_vocalino_prompt(x, tokenizer))
 
     trainer = GRPOTrainer(
         model=model,
