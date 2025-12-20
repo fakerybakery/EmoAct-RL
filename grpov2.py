@@ -37,7 +37,7 @@ SAMPLE_RATE = 24000
 
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
 DEVICE = f"cuda:{LOCAL_RANK}"
-SNAC_DEVICE = f"cuda:{LOCAL_RANK}"  # Use GPU for SNAC to avoid CPU OOM
+SNAC_DEVICE = "cpu"  # CPU is fine, 300GB RAM
 
 # =============================================================================
 # VOCALINO TOKENS - THESE ARE THE CORRECT IDS THE MODEL WAS TRAINED WITH
@@ -169,7 +169,15 @@ def decode_vocalino_audio(text_content, snac_model_ref, debug=False):
         l3_val_d = valid_ids[base + 6] - LAYER_OFFSETS[6]
 
         all_vals = [l1_val, l2_val_a, l2_val_b, l3_val_a, l3_val_b, l3_val_c, l3_val_d]
+
+        # Debug first frame
+        if debug and i == 0 and LOCAL_RANK == 0:
+            log_debug(f"Frame 0 raw IDs: {valid_ids[base:base+7]}")
+            log_debug(f"Frame 0 after offset: {all_vals}")
+
         if not all(0 <= v < SNAC_VOCAB_SIZE for v in all_vals):
+            if debug and LOCAL_RANK == 0 and i < 3:
+                log_debug(f"Skipping frame {i}: values out of range {all_vals}")
             continue
 
         layer_1.append(l1_val)
