@@ -357,8 +357,8 @@ if __name__ == "__main__":
     log_debug(f"Loading SNAC on {SNAC_DEVICE}...")
     snac_model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").to(SNAC_DEVICE)
 
-    log_debug("Loading ASR pipeline...")
-    asr_pipe = pipeline("automatic-speech-recognition", model="openai/whisper-large-v3-turbo", device=LOCAL_RANK)
+    log_debug("Loading ASR pipeline (whisper-tiny for memory efficiency)...")
+    asr_pipe = pipeline("automatic-speech-recognition", model="openai/whisper-tiny", device=LOCAL_RANK)
 
     gte_model = None
     gte_tokenizer = None
