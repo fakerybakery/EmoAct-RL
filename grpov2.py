@@ -50,8 +50,8 @@ SNAC_DEVICE = "cpu"
 # =============================================================================
 TOKEN_OFFSET_BASE = 128266
 SNAC_VOCAB_SIZE = 4096
-LAYER_OFFSETS = [0, 4096, 8192, 8192, 4096, 8192, 8192]
-AUDIO_TOKEN_END = TOKEN_OFFSET_BASE + (3 * SNAC_VOCAB_SIZE)
+LAYER_OFFSETS = [0, 4096, 8192, 12288, 16384, 20480, 24576]  # 7 layers
+AUDIO_TOKEN_END = TOKEN_OFFSET_BASE + (7 * SNAC_VOCAB_SIZE)  # 128266 + 28672 = 156938
 
 # Special token IDs (already in the model's vocabulary)
 START_OF_SPEECH = 128257
@@ -103,41 +103,52 @@ def decode_vocalino_audio(text_content, snac_model_ref):
 
     token_ids = [int(t) for t in token_strings]
 
-    # Filter valid IDs
+    # Filter valid IDs (must be in audio token range)
     valid_ids = [t for t in token_ids if TOKEN_OFFSET_BASE <= t < AUDIO_TOKEN_END]
     valid_ids = valid_ids[:(len(valid_ids) // 7) * 7]
 
-    if len(valid_ids) < 7: return None
+    if len(valid_ids) < 7:
+        return None
 
-    # De-interleave
-    c0, c1, c2 = [], [], []
+    # De-interleave into 3 SNAC layers (matching train_laion.py)
+    layer_1, layer_2, layer_3 = [], [], []
+
     for i in range(len(valid_ids) // 7):
-        chunk = valid_ids[i*7 : (i+1)*7]
-        idx0 = chunk[0] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[0]
-        idx1_a = chunk[1] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[1]
-        idx1_b = chunk[4] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[4]
-        idx2_a = chunk[2] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[2]
-        idx2_b = chunk[3] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[3]
-        idx2_c = chunk[5] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[5]
-        idx2_d = chunk[6] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[6]
+        base = 7 * i
 
-        c0.append(idx0)
-        c1.extend([idx1_a, idx1_b])
-        c2.extend([idx2_a, idx2_b, idx2_c, idx2_d])
+        l1_val = valid_ids[base] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[0]
+        l2_val_a = valid_ids[base + 1] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[1]
+        l3_val_a = valid_ids[base + 2] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[2]
+        l3_val_b = valid_ids[base + 3] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[3]
+        l2_val_b = valid_ids[base + 4] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[4]
+        l3_val_c = valid_ids[base + 5] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[5]
+        l3_val_d = valid_ids[base + 6] - TOKEN_OFFSET_BASE - LAYER_OFFSETS[6]
 
-    # Sanitize
-    c0 = sanitize_indices(c0)
-    c1 = sanitize_indices(c1)
-    c2 = sanitize_indices(c2)
+        all_vals = [l1_val, l2_val_a, l2_val_b, l3_val_a, l3_val_b, l3_val_c, l3_val_d]
+        if not all(0 <= v < SNAC_VOCAB_SIZE for v in all_vals):
+            continue
+
+        layer_1.append(l1_val)
+        layer_2.append(l2_val_a)
+        layer_2.append(l2_val_b)
+        layer_3.append(l3_val_a)
+        layer_3.append(l3_val_b)
+        layer_3.append(l3_val_c)
+        layer_3.append(l3_val_d)
+
+    if not layer_1:
+        return None
 
     try:
         with torch.no_grad():
-            z0 = torch.tensor(c0, device=SNAC_DEVICE).unsqueeze(0)
-            z1 = torch.tensor(c1, device=SNAC_DEVICE).unsqueeze(0)
-            z2 = torch.tensor(c2, device=SNAC_DEVICE).unsqueeze(0)
+            z0 = torch.tensor(layer_1, dtype=torch.long, device=SNAC_DEVICE).unsqueeze(0)
+            z1 = torch.tensor(layer_2, dtype=torch.long, device=SNAC_DEVICE).unsqueeze(0)
+            z2 = torch.tensor(layer_3, dtype=torch.long, device=SNAC_DEVICE).unsqueeze(0)
             audio = snac_model_ref.decode([z0, z1, z2])
-            return audio.squeeze().numpy()
-    except Exception:
+            return audio.squeeze().cpu().numpy()
+    except Exception as e:
+        if LOCAL_RANK == 0:
+            log_debug(f"SNAC decode error: {e}")
         return None
 
 # =============================================================================
