@@ -37,7 +37,7 @@ SAMPLE_RATE = 24000
 
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
 DEVICE = f"cuda:{LOCAL_RANK}"
-SNAC_DEVICE = "cpu"
+SNAC_DEVICE = f"cuda:{LOCAL_RANK}"  # Use GPU for SNAC to avoid CPU OOM
 
 # =============================================================================
 # VOCALINO TOKENS - THESE ARE THE CORRECT IDS THE MODEL WAS TRAINED WITH
@@ -184,15 +184,19 @@ def decode_vocalino_audio(text_content, snac_model_ref, debug=False):
         return None
 
     try:
-        with torch.no_grad():
+        with torch.no_grad(), torch.cuda.amp.autocast():
             z0 = torch.tensor(layer_1, dtype=torch.long, device=SNAC_DEVICE).unsqueeze(0)
             z1 = torch.tensor(layer_2, dtype=torch.long, device=SNAC_DEVICE).unsqueeze(0)
             z2 = torch.tensor(layer_3, dtype=torch.long, device=SNAC_DEVICE).unsqueeze(0)
             audio = snac_model_ref.decode([z0, z1, z2])
-            return audio.squeeze().cpu().numpy()
+            result = audio.squeeze().cpu().numpy()
+            del z0, z1, z2, audio
+            torch.cuda.empty_cache()
+            return result
     except Exception as e:
         if LOCAL_RANK == 0:
             log_debug(f"SNAC decode error: {e}")
+        torch.cuda.empty_cache()
         return None
 
 # =============================================================================
@@ -239,9 +243,13 @@ def wer_reward(prompts, completions, expected_text, **kwargs):
                 log_debug(f"WER: {wer_val:.2f} | Score: {score:.2f} | Tx: '{transcribed[:30]}...'")
 
             scores.append(score)
-        except Exception:
+        except Exception as e:
+            if LOCAL_RANK == 0:
+                log_debug(f"ASR error: {e}")
             scores.append(-1.0)
 
+    # Cleanup
+    torch.cuda.empty_cache()
     return scores
 
 def clap_reward(prompts, completions, caption, **kwargs):
