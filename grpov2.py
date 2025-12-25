@@ -8,7 +8,6 @@ from majestrino_tagger import MajestrinoTagger
 # =============================================================================
 # ENVIRONMENT
 # =============================================================================
-sys.modules["vllm"] = None
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
 
@@ -137,10 +136,19 @@ def decode_vocalino_audio(text_content, snac_model_ref, debug=False):
     if len(token_strings) == 0:
         return None
 
-    token_ids = [int(t) for t in token_strings]
+    # <custom_token_X> mapping:
+    # - Tokenizer decodes token_id as <custom_token_{token_id - 128256}>
+    # - So <custom_token_X> means token_id = X + 128256
+    # - Audio tokens have token_id = 128266 + audio_index
+    # - Therefore: audio_index = token_id - 128266 = (X + 128256) - 128266 = X - 10
+    #
+    # Example: <custom_token_2502> → token_id = 130758 → audio_index = 2492
+
+    # Convert custom_token numbers to actual audio indices (0 to 28671)
+    token_ids = [int(t) - 10 for t in token_strings]
 
     if debug and LOCAL_RANK == 0:
-        log_debug(f"Token ID range: min={min(token_ids)}, max={max(token_ids)}")
+        log_debug(f"Token ID range (after -10 adjust): min={min(token_ids)}, max={max(token_ids)}")
         log_debug(f"Expected range: 0 to {AUDIO_TOKEN_END}")
 
     # Filter valid IDs
@@ -191,20 +199,24 @@ def decode_vocalino_audio(text_content, snac_model_ref, debug=False):
     if not layer_1:
         return None
 
+    if debug and LOCAL_RANK == 0:
+        log_debug(f"SNAC decode: {len(layer_1)} frames, layers: {len(layer_1)}/{len(layer_2)}/{len(layer_3)}")
+
     try:
-        with torch.no_grad(), torch.cuda.amp.autocast():
+        with torch.no_grad():
             z0 = torch.tensor(layer_1, dtype=torch.long, device=SNAC_DEVICE).unsqueeze(0)
             z1 = torch.tensor(layer_2, dtype=torch.long, device=SNAC_DEVICE).unsqueeze(0)
             z2 = torch.tensor(layer_3, dtype=torch.long, device=SNAC_DEVICE).unsqueeze(0)
             audio = snac_model_ref.decode([z0, z1, z2])
             result = audio.squeeze().cpu().numpy()
-            del z0, z1, z2, audio
-            torch.cuda.empty_cache()
+            if debug and LOCAL_RANK == 0:
+                log_debug(f"SNAC decode success: {len(result)} samples, {len(result)/24000:.2f}s")
             return result
     except Exception as e:
         if LOCAL_RANK == 0:
             log_debug(f"SNAC decode error: {e}")
-        torch.cuda.empty_cache()
+            import traceback
+            traceback.print_exc()
         return None
 
 # =============================================================================
@@ -218,6 +230,13 @@ def wer_reward(prompts, completions, expected_text, **kwargs):
 
     if LOCAL_RANK == 0:
         log_debug(f"Target Text: '{expected_text[0][:30]}...'")
+        # Debug: show what prompt was actually used
+        log_debug(f"Prompts type: {type(prompts)}, len: {len(prompts) if prompts else 0}")
+        if prompts:
+            prompt_preview = prompts[0] if isinstance(prompts[0], str) else str(prompts[0])
+            log_debug(f"Prompt preview: {prompt_preview[:200]}...")
+            log_debug(f"Prompt ends with: ...{prompt_preview[-100:]}")
+        log_debug(f"Completions type: {type(completions)}, len: {len(completions)}")
 
     for i, completion in enumerate(completions):
         if isinstance(completion, list):
@@ -228,8 +247,14 @@ def wer_reward(prompts, completions, expected_text, **kwargs):
         if LOCAL_RANK == 0 and i == 0:
             log_debug(f"Completion length: {len(content)} chars")
             log_debug(f"Completion preview: {content[:200]}...")
+            log_debug(f"Completion ends with: ...{content[-100:]}")
             token_strings = re.findall(r"<custom_token_(\d+)>", content)
             log_debug(f"Found {len(token_strings)} audio tokens")
+            # Check for END_OF_SPEECH (128258 -> custom_token_2)
+            if "<custom_token_2>" in content:
+                log_debug("END_OF_SPEECH found in completion!")
+            else:
+                log_debug("WARNING: No END_OF_SPEECH token - model hit max length")
 
         audio_np = decode_vocalino_audio(content, snac_model, debug=(i == 0))
         GLOBAL_AUDIO_CACHE.append(audio_np)
@@ -242,7 +267,7 @@ def wer_reward(prompts, completions, expected_text, **kwargs):
             continue
 
         try:
-            transcribed = asr_pipe(audio_np)["text"].lower().strip()
+            transcribed = asr_pipe(audio_np, return_timestamps=True)["text"].lower().strip()
             target = expected_text[i].lower().strip() if isinstance(expected_text, list) else expected_text[0].lower().strip()
             wer_val = compute_wer(target, transcribed)
             score = max(-1.0, 1.0 - wer_val)
@@ -257,6 +282,8 @@ def wer_reward(prompts, completions, expected_text, **kwargs):
             scores.append(-1.0)
 
     # Cleanup
+    import gc
+    gc.collect()
     torch.cuda.empty_cache()
     return scores
 
@@ -310,7 +337,7 @@ def format_vocalino_prompt(example, tokenizer):
     Working format:
     [START_OF_HUMAN] + encode("Text: {caption}. {text}") + [128009, END_OF_HUMAN, START_OF_AI, START_OF_SPEECH]
     """
-    caption = example['caption']
+    caption = example['caption'].strip().rstrip('.')  # Remove trailing period
     text = example['text']
 
     # Match working_inference.py: "{caption}. {text}" or just "{text}"
@@ -341,7 +368,11 @@ def format_vocalino_prompt(example, tokenizer):
             log_debug(f"  Prompt text (last 100 chars): ...{prompt_text[-100:]}")
         else:
             log_debug(f"[OK] Round-trip successful! Last 5 IDs: {prompt_ids[-5:]}")
-            log_debug(f"  Format: [START_OF_HUMAN] + 'Text: ...' + [EOT, END_OF_HUMAN, START_OF_AI, START_OF_SPEECH]")
+
+        # Show exact prompt structure
+        log_debug(f"  Prompt IDs: [{prompt_ids[0]}] + text + {prompt_ids[-4:]}")
+        log_debug(f"  Expected:   [START_OF_HUMAN=128259] + text + [EOT=128009, END_OF_HUMAN=128260, START_OF_AI=128261, START_OF_SPEECH=128257]")
+        log_debug(f"  Prompt ends with: ...{prompt_text[-80:]}")
 
     return {
         "prompt": prompt_text,
@@ -356,10 +387,11 @@ if __name__ == "__main__":
     # Load tokenizer without modification
     tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH)
 
-    if tokenizer.eos_token_id is None:
-        tokenizer.eos_token_id = END_OF_TEXT
+    # Set EOS to END_OF_SPEECH so generation stops at speech end
+    tokenizer.eos_token_id = END_OF_SPEECH
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = END_OF_TEXT
+
     tokenizer.padding_side = "left"
     tokenizer.model_input_names = ["input_ids", "attention_mask"]
 
@@ -369,12 +401,20 @@ if __name__ == "__main__":
     # Load model without modification
     model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_PATH, torch_dtype=torch.bfloat16)
 
+    # Set EOS on model config for vLLM to respect
+    model.config.eos_token_id = END_OF_SPEECH
+
     # Load helper models
     log_debug(f"Loading SNAC on {SNAC_DEVICE}...")
     snac_model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").to(SNAC_DEVICE)
 
     log_debug("Loading ASR pipeline (whisper-tiny for memory efficiency)...")
-    asr_pipe = pipeline("automatic-speech-recognition", model="openai/whisper-tiny", device=LOCAL_RANK)
+    asr_pipe = pipeline(
+        "automatic-speech-recognition",
+        model="openai/whisper-tiny",
+        device=LOCAL_RANK,
+        generate_kwargs={"language": "en", "task": "transcribe"}
+    )
 
     gte_model = None
     gte_tokenizer = None
@@ -398,18 +438,39 @@ if __name__ == "__main__":
         output_dir="vocalino_0.11_grpo_new",
         learning_rate=1e-5,
         per_device_train_batch_size=1,
-        gradient_accumulation_steps=4,
-        num_generations=8,
-        max_prompt_length=1024,
-        max_completion_length=2048,
+        gradient_accumulation_steps=2,  # Reduced from 4
+        num_generations=4,
+        max_prompt_length=512,  # Reduced from 1024
+        max_completion_length=1536,  # Reduced from 2048
         temperature=0.8,
         bf16=True,
-        use_vllm=False,
         report_to="wandb",
         remove_unused_columns=False,
+
+        # vLLM for fast generation
+        use_vllm=True,
+        vllm_mode="colocate",
+        vllm_gpu_memory_utilization=0.2,  # Reduced from 0.3
+        vllm_max_model_length=2560,  # Reduced from 3072
+        vllm_tensor_parallel_size=1,
+        vllm_enable_sleep_mode=True,
+
+        # Generation params
+        top_p=0.95,
+        generation_kwargs={"stop_token_ids": [END_OF_SPEECH, END_OF_TEXT]},
     )
 
     dataset = load_dataset(DATASET_NAME, split="train")
+    log_debug(f"Dataset columns: {dataset.column_names}")
+    log_debug(f"Dataset size before filter: {len(dataset)}")
+
+    # Filter to English only to avoid language confusion
+    if "language" in dataset.column_names:
+        dataset = dataset.filter(lambda x: x.get("language", "en") == "en")
+        log_debug(f"Filtered to English: {len(dataset)} samples")
+    else:
+        log_debug("No 'language' column found - using all samples")
+
     dataset = dataset.map(lambda x: format_vocalino_prompt(x, tokenizer))
 
     trainer = GRPOTrainer(
